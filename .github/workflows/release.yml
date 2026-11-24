@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    branches: [claude/valsync-settings-manager-fk9lxn, main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --all-targets
+      - name: Build release
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item target/release/valsync.exe out/valsync.exe
+          Copy-Item README.md out/README.md
+          Compress-Archive -Path out/* -DestinationPath out/valsync-windows-x64.zip -Force
+          (Get-FileHash out/valsync.exe -Algorithm SHA256).Hash.ToLower() + "  valsync.exe" | Out-File -Encoding ascii out/SHA256SUMS.txt
+          target/release/valsync.exe --version
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: VALSYNC v0.1.0
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            VALSYNC — VALORANT terminal settings manager for Windows.
+
+            **Download `valsync.exe`**, put it anywhere (e.g. `C:\Tools\VALSYNC`), and run it from Windows Terminal, PowerShell or CMD:
+
+            ```
+            valsync          # interactive menu
+            valsync doctor   # check setup
+            ```
+
+            Built and tested natively on Windows (MSVC) by GitHub Actions. No installer, no admin rights, no background service.
+            See README.md for commands and what can / cannot be transferred.
+          files: |
+            out/valsync.exe
+            out/valsync-windows-x64.zip
+            out/SHA256SUMS.txt

@@ -95,7 +95,7 @@ impl IniDoc {
     /// Parse bytes, tolerating invalid UTF-8 (replaced) and UTF-16 LE files with a BOM.
     pub fn parse_bytes(bytes: &[u8]) -> Self {
         if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-            let units: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let units: Vec<u16> = bytes[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
             return Self::parse(&String::from_utf16_lossy(&units));
         }
         Self::parse(&String::from_utf8_lossy(bytes))

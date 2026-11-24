@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test (native Windows)
+        run: cargo test --all-targets
+      - name: Build release
+        run: cargo build --release
+      - name: Benchmark
+        run: target/release/valsync.exe bench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: valsync-windows-x64
+          path: target/release/valsync.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets

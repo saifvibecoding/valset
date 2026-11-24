@@ -17,6 +17,12 @@ fn main() {
             1
         }
     };
+    if std::env::var_os("VALSYNC_PRINT_PEAK_MEM").is_some()
+        && let Some(b) = valsync::bench::peak_rss_bytes()
+    {
+        let ms = valsync::bench::PROCESS_START.get().map(|s| s.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+        eprintln!("[valsync] peak memory {:.1} MB, {:.1} ms", b as f64 / 1048576.0, ms);
+    }
     std::process::exit(code);
 }
 

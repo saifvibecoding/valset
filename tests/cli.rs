@@ -12,7 +12,7 @@ fn run(env: &Env, args: &[&str]) -> Output {
         .env("VALSYNC_HOME", &env.paths.data_dir)
         .env("VALSYNC_VALORANT_CONFIG", &env.paths.valorant_config)
         .env("VALSYNC_FAKE_PROCESSES", "riotclientservices.exe")
-        .env_remove("RIOT_API_KEY")
+        .env("VALSYNC_LOCKFILE", env.dir.path().join("no-riot-client"))
         .current_dir(env.dir.path())
         .stdin(Stdio::null())
         .output()
@@ -35,9 +35,10 @@ fn fails(o: &Output) -> String {
 fn full_cli_workflow() {
     let env = Env::new();
     let s = ok(&run(&env, &["status"]));
-    assert!(s.contains("Active account") && s.contains("aaaaaaaa"));
-    let s = ok(&run(&env, &["save", "Main", "--crosshair-code", "0;P;c;5"]));
-    assert!(s.contains("Saved profile 'Main'"));
+    assert!(s.contains("Account") && s.contains("Riot Client is not running"), "{s}");
+    let s = ok(&run(&env, &["save", "Main"]));
+    assert!(s.contains("Saved 'Main'"), "{s}");
+    assert!(s.contains("Only video settings"), "offline save explains what is missing");
     // Overwrite needs confirmation; non-interactive without --yes refuses.
     let s = fails(&run(&env, &["save", "Main"]));
     assert!(s.contains("--yes"));
@@ -48,8 +49,7 @@ fn full_cli_workflow() {
     let s = fails(&run(&env, &["load", "Main"]));
     assert!(s.contains("--yes"), "{s}");
     let s = ok(&run(&env, &["-y", "load", "Main"]));
-    assert!(s.contains("Applied and verified"), "{s}");
-    assert!(s.contains("Manual checklist") && s.contains("Crosshair code: 0;P;c;5"));
+    assert!(s.contains("Done!"), "{s}");
     assert!(env.gus(b()).contains("ResolutionSizeX=1920"));
     ok(&run(&env, &["-y", "restore"]));
     assert!(env.gus(b()).contains("ResolutionSizeX=1280"));
@@ -63,9 +63,9 @@ fn full_cli_workflow() {
     assert!(s.contains("verified"));
     ok(&run(&env, &["-y", "restore", "--original"]));
     let s = ok(&run(&env, &["accounts"]));
-    assert!(s.contains("bbbbbbbb") && s.contains("aaaaaaaa"));
+    assert_eq!(s.matches("EU").count(), 2, "{s}");
     let s = ok(&run(&env, &["accounts", "switches"]));
-    assert!(s.contains("aaaaaaaa") || s.contains("Unknown"));
+    assert!(s.contains("aaaaaaaa") || s.contains("Unknown"), "{s}");
 }
 
 #[test]
@@ -106,23 +106,25 @@ fn refuses_when_game_running_and_doctor_reports() {
         .env("VALSYNC_HOME", &env.paths.data_dir)
         .env("VALSYNC_VALORANT_CONFIG", &env.paths.valorant_config)
         .env("VALSYNC_FAKE_PROCESSES", "valorant-win64-shipping.exe")
+        .env("VALSYNC_LOCKFILE", env.dir.path().join("no-riot-client"))
         .stdin(Stdio::null())
         .output()
         .unwrap();
     let s = fails(&o);
     assert!(s.contains("VALORANT is running"), "{s}");
     let s = ok(&run(&env, &["doctor"]));
-    assert!(s.contains("Database integrity") && s.contains("Settings support"));
+    assert!(s.contains("Database") && s.contains("Riot Client running"), "{s}");
     let s = ok(&run(&env, &["config", "set", "live_poll_secs", "90"]));
     assert!(s.contains("90"));
-    let s = fails(&run(&env, &["config", "set", "live_poll_secs", "5"]));
+    let s = fails(&run(&env, &["config", "set", "live_poll_secs", "2"]));
     assert!(s.contains("minimum"));
     let s = ok(&run(&env, &["--help"]));
     for cmd in ["status", "accounts", "save", "load", "restore", "undo", "redo", "profiles", "backups", "compare", "export", "import", "live", "history", "doctor"] {
         assert!(s.contains(cmd), "help is missing {cmd}");
     }
     let s = fails(&run(&env, &["history"]));
-    assert!(s.contains("Riot Sign On"), "{s}");
-    let s = ok(&run(&env, &["live", "--once"]));
-    assert!(s.contains("no supported live-match API"));
+    assert!(s.contains("Riot Client"), "{s}");
+    ok(&run(&env, &["history", "--offline"]));
+    let s = fails(&run(&env, &["live", "--once"]));
+    assert!(s.contains("Riot Client"), "{s}");
 }

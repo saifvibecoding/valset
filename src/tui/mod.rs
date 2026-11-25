@@ -12,8 +12,7 @@ use crate::catalog::{Category, Scope};
 use crate::db::{AccountRow, BackupKind, BackupRow, Db, OpRow, ProfileRow};
 use crate::engine::{Change, Engine, LoadOptions, LoadPlan, Target};
 use crate::profile::{self, Profile};
-use crate::riot::RiotApi;
-use crate::service::{self, HistoryData, StatusInfo};
+use crate::service::{self, HistoryData, LiveData, StatusInfo};
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
@@ -85,7 +84,6 @@ pub enum InputKind {
     Import,
     Export(String),
     BackupLabel,
-    RiotId(String),
     Preferred(String),
     Setting(String),
 }
@@ -141,11 +139,10 @@ pub struct AccountsState {
 }
 
 pub struct LiveState {
-    pub data: Option<HistoryData>,
+    pub data: Option<LiveData>,
     pub loading: bool,
     pub last_fetch: Option<Instant>,
     pub error: Option<String>,
-    pub map: Option<String>,
 }
 
 pub struct HistoryState {
@@ -162,6 +159,7 @@ pub struct BackupsState {
     pub all: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Screen {
     Main,
     Text(TextView),
@@ -176,15 +174,13 @@ pub enum Screen {
 }
 
 enum Job {
-    History { puuid: String, limit: usize, live: bool },
-    Rso { puuid: String },
-    Identity { puuid: String },
-    RiotId { puuid: String, riot_id: String },
+    History { limit: usize },
+    Live { cached: Option<crate::matches::LiveView> },
 }
 
 enum JobResult {
-    History { live: bool, result: Box<Result<HistoryData>> },
-    Message(Level, String),
+    History(Box<Result<HistoryData>>),
+    Live(Box<Result<LiveData>>),
     Done,
 }
 
@@ -201,6 +197,7 @@ pub struct App {
     tx: Sender<JobResult>,
     rx: Receiver<JobResult>,
     jobs_running: usize,
+    last_riot_check: Instant,
     pub quit: bool,
     pub tick: u64,
 }
@@ -239,54 +236,21 @@ pub fn run(engine: Engine, start_live: bool) -> Result<()> {
     res
 }
 
-fn spawn_job(job: Job, db_path: PathBuf, cfg: AppConfig, tx: Sender<JobResult>) {
+fn spawn_job(job: Job, logs: PathBuf, db_path: PathBuf, cfg: AppConfig, tx: Sender<JobResult>) {
     std::thread::spawn(move || {
         let rt = service::runtime();
-        let api = RiotApi::new(cfg.api_key());
-        let open = Db::open(&db_path);
-        let mut db = match open {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.send(JobResult::Message(Level::Error, format!("{e:#}")));
-                let _ = tx.send(JobResult::Done);
-                return;
-            }
-        };
-        match job {
-            Job::History { puuid, limit, live } => {
-                let result = rt.block_on(service::history(&api, &mut db, &cfg, &puuid, limit, true));
-                let _ = tx.send(JobResult::History { live, result: Box::new(result) });
-            }
-            Job::Rso { puuid } => {
-                let tx2 = tx.clone();
-                let r = rt.block_on(service::rso_link(&api, &mut db, &cfg, &puuid, true, move |u| {
-                    let _ = tx2.send(JobResult::Message(Level::Info, format!("Browser opened for Riot Sign On. If it did not open, visit: {u}")));
-                }));
-                let _ = tx.send(match r {
-                    Ok(id) => JobResult::Message(Level::Ok, format!("Linked {id} with RSO consent")),
-                    Err(e) => JobResult::Message(Level::Error, format!("RSO: {e:#}")),
-                });
-            }
-            Job::Identity { puuid } => {
-                let r = rt.block_on(service::refresh_identity(&api, &mut db, &cfg, &puuid));
-                let _ = tx.send(match r {
-                    Ok(Some(id)) => JobResult::Message(Level::Ok, format!("Riot ID: {id}")),
-                    Ok(None) => JobResult::Message(Level::Warn, "Riot ID not available (API key required; PUUID may be app-encrypted)".into()),
-                    Err(e) => JobResult::Message(Level::Error, format!("{e:#}")),
-                });
-            }
-            Job::RiotId { puuid, riot_id } => {
-                let r = rt.block_on(service::set_riot_id(&api, &mut db, &cfg, &puuid, &riot_id));
-                let _ = tx.send(match r {
-                    Ok(service::IdentityResult::Verified) => JobResult::Message(Level::Ok, format!("{riot_id} verified via ACCOUNT-V1")),
-                    Ok(service::IdentityResult::ExistsUnverified) => {
-                        JobResult::Message(Level::Ok, format!("{riot_id} exists; ownership unverified (link with RSO to verify)"))
-                    }
-                    Ok(service::IdentityResult::StoredManual) => JobResult::Message(Level::Ok, format!("Saved {riot_id} (unverified: no API key)")),
-                    Err(e) => JobResult::Message(Level::Warn, format!("{e:#}")),
-                });
-            }
-        }
+        let result = (|| -> Result<JobResult> {
+            let db = Db::open(&db_path)?;
+            let session = rt.block_on(service::connect(&logs, &db, &cfg))?;
+            Ok(match job {
+                Job::History { limit } => JobResult::History(Box::new(rt.block_on(service::history(&session, &db, &cfg, limit)))),
+                Job::Live { cached } => JobResult::Live(Box::new(rt.block_on(service::live(&session, &db, &cfg, cached.as_ref())))),
+            })
+        })();
+        let _ = tx.send(match result {
+            Ok(r) => r,
+            Err(e) => JobResult::Live(Box::new(Err(e))),
+        });
         let _ = tx.send(JobResult::Done);
     });
 }
@@ -316,6 +280,7 @@ impl App {
             tx,
             rx,
             jobs_running: 0,
+            last_riot_check: Instant::now(),
             quit: false,
             tick: 0,
         };
@@ -327,22 +292,15 @@ impl App {
         } else if !r.failed_ops.is_empty() {
             app.banner = Some(format!("Recovery failed for {} operation(s); run `valsync doctor`.", r.failed_ops.len()));
         }
-        // Fill in the active account's Riot ID in the background when possible.
-        if let Some((acc, _, _)) = &app.status.active
-            && acc.riot_id().is_none()
-            && app.engine.config.api_key().is_some()
-        {
-            app.start_job(Job::Identity { puuid: acc.puuid.clone() }, false);
-        }
         Ok(app)
     }
 
     fn start_job(&mut self, job: Job, show_busy: bool) {
         self.jobs_running += 1;
         if show_busy {
-            self.busy = Some(("Contacting Riot API".into(), Instant::now()));
+            self.busy = Some(("Talking to Riot".into(), Instant::now()));
         }
-        spawn_job(job, self.engine.paths.db_path(), self.engine.config.clone(), self.tx.clone());
+        spawn_job(job, self.engine.paths.valorant_logs.clone(), self.engine.paths.db_path(), self.engine.config.clone(), self.tx.clone());
     }
 
     pub fn notify(&mut self, level: Level, msg: impl Into<String>) {
@@ -378,9 +336,8 @@ impl App {
                     self.refresh_status();
                     self.reload_screen_data();
                 }
-                JobResult::Message(l, m) => self.notify(l, m),
-                JobResult::History { live, result } => match (&mut self.screen, live) {
-                    (Screen::Live(st), true) => {
+                JobResult::Live(result) => {
+                    if let Screen::Live(st) = &mut self.screen {
                         st.loading = false;
                         st.last_fetch = Some(Instant::now());
                         match *result {
@@ -390,8 +347,13 @@ impl App {
                             }
                             Err(e) => st.error = Some(format!("{e:#}")),
                         }
+                    } else if let (Screen::History(st), Err(e)) = (&mut self.screen, *result) {
+                        st.loading = false;
+                        st.error = Some(format!("{e:#}"));
                     }
-                    (Screen::History(st), false) => {
+                }
+                JobResult::History(result) => {
+                    if let Screen::History(st) = &mut self.screen {
                         st.loading = false;
                         match *result {
                             Ok(d) => {
@@ -401,8 +363,7 @@ impl App {
                             Err(e) => st.error = Some(format!("{e:#}")),
                         }
                     }
-                    _ => {}
-                },
+                }
             }
         }
         if self.toast.as_ref().map(|t| t.2.elapsed() > Duration::from_secs(8)).unwrap_or(false) {
@@ -417,31 +378,29 @@ impl App {
                 dirty = true;
             }
         }
-        // Live screen: refresh permitted data at the configured interval while the game runs.
-        let poll = Duration::from_secs(self.engine.config.poll_secs());
-        let valorant = self.status.processes.valorant;
-        let mut want_live = None;
-        if let Screen::Live(st) = &mut self.screen {
-            let m = if valorant { crate::game::current_map_from_log(&self.engine.paths.valorant_logs) } else { None };
-            if m != st.map {
-                st.map = m;
+        // Follow Riot Client sign-ins / account switches.
+        if self.last_riot_check.elapsed() > Duration::from_secs(10) && self.modal.is_none() && self.jobs_running == 0 {
+            self.last_riot_check = Instant::now();
+            if self.engine.refresh_riot() {
+                self.refresh_status();
                 dirty = true;
             }
-            if !st.loading && valorant && st.last_fetch.map(|t| t.elapsed() > poll).unwrap_or(true) {
-                want_live = self.status.active.as_ref().map(|a| a.0.puuid.clone());
-                st.loading = want_live.is_some();
-            }
         }
-        if let Some(p) = want_live
-            && self.status.active.as_ref().map(|a| a.0.consent).unwrap_or(false)
+        // Live screen: refresh while in a match (configurable), slowly otherwise.
+        let in_game = self.status.processes.valorant;
+        let poll = Duration::from_secs(if in_game { self.engine.config.poll_secs() } else { 60 });
+        let signed_in = self.status.riot_signed_in;
+        let mut start = None;
+        if let Screen::Live(st) = &mut self.screen
+            && !st.loading
+            && signed_in
+            && st.last_fetch.map(|t| t.elapsed() > poll).unwrap_or(true)
         {
-            self.start_job(Job::History { puuid: p, limit: 5, live: true }, false);
-        } else if let Screen::Live(st) = &mut self.screen
-            && st.loading
-            && self.jobs_running == 0
-        {
-            st.loading = false;
-            st.last_fetch = Some(Instant::now());
+            st.loading = true;
+            start = Some(st.data.as_ref().and_then(|d| d.view.clone()));
+        }
+        if let Some(cached) = start {
+            self.start_job(Job::Live { cached }, false);
         }
         dirty
     }
@@ -551,38 +510,27 @@ impl App {
             4 => self.screen = Screen::Profiles(ProfilesState { rows: self.engine.db.profiles().unwrap_or_default(), sel: 0, mark: None }),
             5 => self.screen = Screen::Accounts(self.accounts_state()),
             6 => {
-                let mut st = LiveState { data: None, loading: false, last_fetch: None, error: None, map: None };
-                if let Some(p) = self.active_puuid() {
-                    // Show stored data instantly, then refresh in the background.
-                    let cfg = self.engine.config.clone();
-                    let rt = service::runtime();
-                    match rt.block_on(service::history(&RiotApi::new(None), &mut self.engine.db, &cfg, &p, 5, false)) {
-                        Ok(d) => st.data = Some(d),
-                        Err(e) => {
-                            st.error = Some(format!("{e:#}"));
-                            st.last_fetch = Some(Instant::now());
-                        }
-                    }
+                let mut st = LiveState { data: None, loading: false, last_fetch: None, error: None };
+                if !self.status.riot_signed_in {
+                    st.error = Some("Open the Riot Client and sign in to see your live match.".into());
                 }
                 self.screen = Screen::Live(st);
             }
             7 => {
                 let Some(p) = self.active_puuid() else {
-                    self.notify(Level::Error, "No active account detected");
+                    self.notify(Level::Error, "Open the Riot Client and sign in first");
                     return;
                 };
-                let cfg = self.engine.config.clone();
-                let rt = service::runtime();
                 let mut st = HistoryState { data: None, loading: false, sel: 0, detail: false, error: None };
-                match rt.block_on(service::history(&RiotApi::new(None), &mut self.engine.db, &cfg, &p, 20, false)) {
-                    Ok(d) => {
-                        st.data = Some(d);
-                        if self.engine.config.api_key().is_some() {
-                            st.loading = true;
-                            self.start_job(Job::History { puuid: p, limit: 20, live: false }, true);
-                        }
-                    }
+                match service::history_offline(&self.engine.db, &self.engine.config, &p, 20) {
+                    Ok(d) => st.data = Some(d),
                     Err(e) => st.error = Some(format!("{e:#}")),
+                }
+                if self.status.riot_signed_in {
+                    st.loading = true;
+                    self.start_job(Job::History { limit: 20 }, false);
+                } else {
+                    st.error = Some("Showing saved matches. Open the Riot Client and sign in to load new ones.".into());
                 }
                 self.screen = Screen::History(st);
             }
@@ -626,12 +574,12 @@ impl App {
             Screen::Text(tv) => tv.back.map(|b| *b).unwrap_or(Screen::Main),
             Screen::Load(mut st) => match st.stage {
                 LoadStage::Preview => {
-                    st.stage = LoadStage::Categories;
+                    st.stage = LoadStage::Profiles;
                     st.plan = None;
                     Screen::Load(st)
                 }
                 LoadStage::Categories => {
-                    st.stage = LoadStage::Profiles;
+                    st.stage = LoadStage::Preview;
                     Screen::Load(st)
                 }
                 LoadStage::Profiles => Screen::Main,
@@ -698,17 +646,7 @@ impl App {
             Screen::Accounts(_) => self.on_accounts_key(code),
             Screen::Live(st) => match code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.back(),
-                KeyCode::Char('r') => {
-                    st.last_fetch = None;
-                    if !self.status.active.as_ref().map(|a| a.0.consent).unwrap_or(false) {
-                        self.notify(Level::Warn, "Link the account with Riot Sign On to load match data (Manage Riot Accounts → l)");
-                    } else if let Some(p) = self.active_puuid() {
-                        if let Screen::Live(st) = &mut self.screen {
-                            st.loading = true;
-                        }
-                        self.start_job(Job::History { puuid: p, limit: 5, live: true }, true);
-                    }
-                }
+                KeyCode::Char('r') => st.last_fetch = None,
                 _ => {}
             },
             Screen::History(st) => {
@@ -719,11 +657,13 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') if !st.detail => st.sel = (st.sel + 1).min(n.saturating_sub(1)),
                     KeyCode::Enter if n > 0 => st.detail = !st.detail,
                     KeyCode::Char('r') => {
-                        if let Some(p) = self.active_puuid() {
+                        if self.status.riot_signed_in {
                             if let Screen::History(st) = &mut self.screen {
                                 st.loading = true;
                             }
-                            self.start_job(Job::History { puuid: p, limit: 20, live: false }, true);
+                            self.start_job(Job::History { limit: 20 }, true);
+                        } else {
+                            self.notify(Level::Warn, "Open the Riot Client and sign in to load new matches");
                         }
                     }
                     _ => {}
@@ -820,10 +760,6 @@ impl App {
                     let id = self.engine.create_manual_backup(&t, &value)?;
                     self.notify(Level::Ok, format!("Created manual backup #{id}"));
                 }
-                InputKind::RiotId(puuid) => {
-                    crate::accounts::parse_riot_id(&value).context("expected Name#TAG")?;
-                    self.start_job(Job::RiotId { puuid, riot_id: value.clone() }, true);
-                }
                 InputKind::Preferred(puuid) => {
                     if value.is_empty() {
                         self.engine.db.set_preferred_profile(&puuid, None)?;
@@ -856,13 +792,19 @@ impl App {
                     let (t, _) = self.engine.active_target()?;
                     let out = self.engine.save_profile(&t, &name, true, None, None, Vec::new())?;
                     let mut lines = vec![
-                        styled(format!("✔ Saved profile '{}' from {}", out.profile.name, self.engine.account_label(&t.puuid)), Style::new().fg(Color::Green)),
-                        line(""),
-                        line(format!("  {} local settings — saved and transferable", out.report.local)),
-                        line(format!("  {} account-synced (cloud) settings — recorded for the manual checklist", out.report.cloud)),
-                        line(format!("  {} entries excluded (identifiers, hardware, metadata)", out.report.excluded)),
+                        styled(format!("✔ Saved '{}' from {}", out.profile.name, self.engine.account_label(&t.puuid)), Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)),
                         line(""),
                     ];
+                    for (k, v) in out.profile.cloud.as_ref().map(crate::cloud::highlights).unwrap_or_default() {
+                        lines.push(Line::from(vec![Span::styled(format!("  {k:<20}"), Style::new().fg(MUTED)), Span::styled(v, Style::new().add_modifier(Modifier::BOLD))]));
+                    }
+                    if !out.cloud {
+                        lines.push(styled(
+                            "  Only video settings were saved — the Riot Client isn't signed in to this account. Sign in and save again to include sensitivity, crosshair and keybinds.",
+                            Style::new().fg(Color::Yellow),
+                        ));
+                    }
+                    lines.push(line(""));
                     lines.extend(category_lines(&out.profile));
                     self.status.last_saved_profile = Some(name);
                     self.show_text("Save Current Settings", lines, false);
@@ -901,10 +843,9 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => st.sel = (st.sel + 1).min(st.profiles.len().saturating_sub(1)),
                 KeyCode::Enter => {
                     let p = &st.profiles[st.sel].profile;
-                    let counts = p.categories();
-                    st.cats = counts.iter().map(|(c, (l, cl))| (*c, *l, *cl, *l > 0)).collect();
+                    st.cats = p.categories().iter().map(|(c, (l, cl))| (*c, *l, *cl, true)).collect();
                     st.cat_sel = 0;
-                    st.stage = LoadStage::Categories;
+                    self.replan();
                 }
                 _ => {}
             },
@@ -924,27 +865,17 @@ impl App {
                     }
                 }
                 KeyCode::Enter => {
-                    let selected: BTreeSet<Category> = st.cats.iter().filter(|c| c.3).map(|c| c.0).collect();
-                    if selected.is_empty() {
+                    if !st.cats.iter().any(|c| c.3) {
                         self.notify(Level::Warn, "Select at least one category (Space)");
                         return;
                     }
-                    let opts = LoadOptions { categories: Some(selected), include_cloud: self.engine.config.write_cloud_cache };
-                    let Screen::Load(st) = &mut self.screen else { return };
-                    let Some(t) = st.target.clone() else { return };
-                    match self.engine.plan_load(&st.profiles[st.sel].profile, &t, &opts) {
-                        Ok(plan) => {
-                            st.plan = Some(plan);
-                            st.stage = LoadStage::Preview;
-                            st.scroll = 0;
-                        }
-                        Err(e) => self.notify(Level::Error, format!("{e:#}")),
-                    }
+                    self.replan();
                 }
                 _ => {}
             },
             LoadStage::Preview => match code {
                 KeyCode::Esc | KeyCode::Backspace => self.back(),
+                KeyCode::Char('c') => st.stage = LoadStage::Categories,
                 KeyCode::Down | KeyCode::Char('j') => st.scroll = st.scroll.saturating_add(1),
                 KeyCode::Up | KeyCode::Char('k') => st.scroll = st.scroll.saturating_sub(1),
                 KeyCode::Enter | KeyCode::Char('y') => {
@@ -974,12 +905,31 @@ impl App {
         }
     }
 
+    fn load_options(st: &LoadState) -> LoadOptions {
+        let all = st.cats.iter().all(|c| c.3);
+        let categories = if all { None } else { Some(st.cats.iter().filter(|c| c.3).map(|c| c.0).collect::<BTreeSet<Category>>()) };
+        LoadOptions { categories, include_cloud: false }
+    }
+
+    fn replan(&mut self) {
+        let Screen::Load(st) = &mut self.screen else { return };
+        let Some(t) = st.target.clone() else { return };
+        let opts = Self::load_options(st);
+        match self.engine.plan_load(&st.profiles[st.sel].profile, &t, &opts) {
+            Ok(plan) => {
+                st.plan = Some(plan);
+                st.stage = LoadStage::Preview;
+                st.scroll = 0;
+            }
+            Err(e) => self.notify(Level::Error, format!("{e:#}")),
+        }
+    }
+
     fn apply_load(&mut self) -> Result<()> {
         let Screen::Load(st) = &self.screen else { return Ok(()) };
         let profile = st.profiles[st.sel].profile.clone();
         let t = st.target.clone().context("no target")?;
-        let selected: BTreeSet<Category> = st.cats.iter().filter(|c| c.3).map(|c| c.0).collect();
-        let opts = LoadOptions { categories: Some(selected), include_cloud: self.engine.config.write_cloud_cache };
+        let opts = Self::load_options(st);
         self.busy = Some(("Applying settings".into(), Instant::now()));
         let out = self.engine.apply_load(&profile, &t, &opts);
         self.busy = None;
@@ -1247,54 +1197,9 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => self.back(),
             KeyCode::Up | KeyCode::Char('k') => st.sel = st.sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => st.sel = (st.sel + 1).min(st.rows.len().saturating_sub(1)),
-            KeyCode::Char('a') => {
-                self.engine.config.manual_active_account = None;
-                let _ = self.engine.save_config();
-                self.notify(Level::Ok, "Using automatic account detection");
-                self.refresh_status();
-                self.reload_screen_data();
-            }
             _ => {
-                let Some((acc, local, _)) = cur else { return };
+                let Some((acc, _, _)) = cur else { return };
                 match code {
-                    KeyCode::Enter | KeyCode::Char('s') => {
-                        if !local {
-                            self.notify(Level::Error, "This account has no config folder on this PC; launch VALORANT with it once first.");
-                            return;
-                        }
-                        self.engine.config.manual_active_account = Some(acc.puuid.clone());
-                        let _ = self.engine.save_config();
-                        self.notify(Level::Ok, format!("{} set as manual fallback (VALORANT's own last-user record still wins when present)", acc.display()));
-                        self.refresh_status();
-                        self.reload_screen_data();
-                    }
-                    KeyCode::Char('n') => {
-                        self.modal = Some(Modal::Input {
-                            title: "Set Riot ID".into(),
-                            prompt: format!("Riot ID (Name#TAG) for {}:", crate::db::short_id(&acc.puuid)),
-                            value: acc.riot_id().unwrap_or_default(),
-                            kind: InputKind::RiotId(acc.puuid.clone()),
-                            mask: false,
-                        })
-                    }
-                    KeyCode::Char('i') => self.start_job(Job::Identity { puuid: acc.puuid.clone() }, true),
-                    KeyCode::Char('l') => {
-                        if self.active_puuid().as_deref() != Some(acc.puuid.as_str()) {
-                            self.notify(Level::Warn, "Link the account that is currently active (switch accounts in the Riot Client first)");
-                            return;
-                        }
-                        if self.engine.config.rso_client_id.is_none() {
-                            self.notify(Level::Warn, "RSO needs a client id/secret from an approved Riot product (Application Settings)");
-                            return;
-                        }
-                        self.start_job(Job::Rso { puuid: acc.puuid.clone() }, true);
-                    }
-                    KeyCode::Char('u') => {
-                        let _ = self.engine.db.set_account_consent(&acc.puuid, false);
-                        let _ = self.engine.db.conn.execute("DELETE FROM matches WHERE owner_puuid=?1", [&acc.puuid]);
-                        self.notify(Level::Ok, "RSO consent withdrawn and stored match data deleted");
-                        self.reload_screen_data();
-                    }
                     KeyCode::Char('p') => {
                         self.modal = Some(Modal::Input {
                             title: "Preferred profile".into(),
@@ -1422,7 +1327,7 @@ pub fn change_line(c: &Change) -> Line<'static> {
         Span::styled(format!("{:>14}", c.old_display()), Style::new().fg(Color::Red)),
         Span::raw(" → "),
         Span::styled(c.new_display(), Style::new().fg(Color::Green)),
-        Span::styled(if c.scope == Scope::Cloud { "  [cloud cache]".to_string() } else { String::new() }, Style::new().fg(Color::Yellow)),
+        Span::styled(if c.file == crate::cloud::CLOUD_REL { String::new() } else { "  [video]".to_string() }, Style::new().fg(MUTED)),
     ])
 }
 
@@ -1432,19 +1337,13 @@ pub fn truncate(s: &str, n: usize) -> String {
 
 pub fn category_lines(p: &Profile) -> Vec<Line<'static>> {
     let counts = p.categories();
-    let mut out = vec![styled(format!("{:<26}{:>7}{:>7}   Support", "Category", "Local", "Cloud"), Style::new().add_modifier(Modifier::BOLD))];
+    let mut out = vec![styled(format!("  {:<26}{:>9}", "What's included", "Settings"), Style::new().add_modifier(Modifier::BOLD))];
     for c in Category::ALL {
         let (l, cl) = counts.get(&c).copied().unwrap_or((0, 0));
-        let (txt, col) = if l > 0 {
-            ("transferred", Color::Green)
-        } else if cl > 0 {
-            ("manual checklist (cloud-synced)", Color::Yellow)
-        } else if c.typical_scope() == Scope::Cloud {
-            ("cloud-synced — not stored locally", MUTED)
-        } else {
-            ("not present in files", MUTED)
-        };
-        out.push(Line::from(vec![Span::raw(format!("{:<26}{:>7}{:>7}   ", c.label(), l, cl)), Span::styled(txt.to_string(), Style::new().fg(col))]));
+        if l + cl == 0 {
+            continue;
+        }
+        out.push(Line::from(vec![Span::raw(format!("  {:<26}{:>9}", c.label(), l + cl))]));
     }
     out
 }

@@ -396,7 +396,7 @@ fn export_import_roundtrip_and_tamper_detection() {
 fn import_sanitizes_hostile_profiles() {
     use valsync::catalog::Scope;
     use valsync::profile::SettingEntry;
-    let mut p = Profile { name: "Evil".into(), created_at: "x".into(), patch: None, notes: None, settings: vec![], manual: vec![] };
+    let mut p = Profile { name: "Evil".into(), created_at: "x".into(), patch: None, notes: None, settings: vec![], manual: vec![], cloud: None };
     let entry = |file: &str, key: &str, v: &str| SettingEntry {
         file: file.into(),
         section: "S".into(),
@@ -482,4 +482,161 @@ fn backup_retention_prunes_only_automatic_backups() {
     assert!(e.db.original_backup(b()).unwrap().is_some());
     // Undo still works for the most recent change.
     e.undo(b(), false).unwrap();
+}
+
+// ------------------------------------------------------------------ account settings (Riot cloud)
+
+fn cloud_setup(env: &Env) -> (valsync::engine::Engine, valsync::cloud::MemCloud, Profile) {
+    let (mut e, mc) = env.engine_with_cloud();
+    let (ta, _) = e.active_target().unwrap();
+    assert_eq!(ta.puuid, a());
+    let out = e.save_profile(&ta, "Main", false, None, None, vec![]).unwrap();
+    assert!(out.cloud);
+    env.switch_to(b());
+    mc.sign_in(b());
+    let p = e.db.profile("Main").unwrap().unwrap().profile;
+    (e, mc, p)
+}
+
+#[test]
+fn cloud_sensitivity_example_0_25_to_0_176_and_back() {
+    let env = Env::new();
+    let (mut e, mc, p) = cloud_setup(&env);
+    let original_b = mc.get(b());
+    let (tb, m) = e.active_target().unwrap();
+    assert_eq!((tb.puuid.as_str(), m), (b(), DetectMethod::RiotClient));
+    let out = e.apply_load(&p, &tb, &LoadOptions::default()).unwrap();
+    assert!(out.plan.manual.is_empty(), "nothing left for a manual checklist when signed in");
+    assert_eq!(common::sens(&mc.get(b())), 0.176);
+    assert!(mc.get(b()).to_string().contains("device-of-B"), "machine-specific entries stay");
+    assert!(mc.get(b()).to_string().contains("0;P;c;5"));
+    // The backup holds B's account settings.
+    let pre = e.db.backup_files(out.txn.unwrap().pre_backup).unwrap();
+    assert!(pre.iter().any(|f| f.rel_path == valsync::cloud::CLOUD_REL));
+    e.undo(b(), false).unwrap();
+    assert_eq!(mc.get(b()), original_b, "Restore Previous Settings gives 0.25 back, exactly");
+    e.redo(b(), false).unwrap();
+    assert_eq!(common::sens(&mc.get(b())), 0.176);
+    e.restore_original(b(), false).unwrap();
+    assert_eq!(mc.get(b()), original_b);
+}
+
+#[test]
+fn cloud_selective_categories() {
+    let env = Env::new();
+    let (mut e, mc, p) = cloud_setup(&env);
+    let (tb, _) = e.active_target().unwrap();
+    let cats: BTreeSet<Category> = [Category::Crosshair].into_iter().collect();
+    e.apply_load(&p, &tb, &LoadOptions { categories: Some(cats), include_cloud: false }).unwrap();
+    let doc = mc.get(b());
+    assert_eq!(common::sens(&doc), 0.25, "sensitivity untouched");
+    assert!(doc.to_string().contains("0;P;c;5"), "crosshair copied");
+    assert!(env.gus(b()).contains("ResolutionSizeX=1280"), "video untouched");
+}
+
+#[test]
+fn cloud_skipped_when_signed_into_another_account() {
+    let env = Env::new();
+    let (mut e, mc, p) = cloud_setup(&env);
+    mc.sign_in(a()); // Riot Client still on A, but we target B's folder explicitly
+    let tb = env.target(b());
+    let before = mc.get(b());
+    let out = e.apply_load(&p, &tb, &LoadOptions::default()).unwrap();
+    assert!(out.plan.warnings.iter().any(|w| w.contains("signed in as")), "{:?}", out.plan.warnings);
+    assert_eq!(mc.get(b()), before);
+    assert_eq!(common::sens(&mc.get(a())), 0.176, "never writes the wrong account");
+    assert!(env.gus(b()).contains("ResolutionSizeX=1920"), "video settings still applied");
+}
+
+#[test]
+fn cloud_upload_failure_rolls_back_files_too() {
+    let env = Env::new();
+    let (mut e, mc, p) = cloud_setup(&env);
+    let files_before = env.snapshot_bytes(b());
+    let cloud_before = mc.get(b());
+    mc.state.borrow_mut().fail_stores = 1;
+    let (tb, _) = e.active_target().unwrap();
+    let err = e.apply_load(&p, &tb, &LoadOptions::default()).unwrap_err();
+    assert!(matches!(err.downcast_ref::<EngineError>(), Some(EngineError::RolledBack(_))), "{err:#}");
+    assert_eq!(env.snapshot_bytes(b()), files_before);
+    assert_eq!(mc.get(b()), cloud_before);
+}
+
+#[test]
+fn cloud_server_mangling_is_caught_and_rolled_back() {
+    let env = Env::new();
+    let (mut e, mc, p) = cloud_setup(&env);
+    let cloud_before = mc.get(b());
+    mc.state.borrow_mut().mangle_next_store = true;
+    let (tb, _) = e.active_target().unwrap();
+    let err = e.apply_load(&p, &tb, &LoadOptions::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("did not keep"), "{err:#}");
+    assert_eq!(mc.get(b()), cloud_before);
+}
+
+#[test]
+fn crash_after_cloud_upload_is_recovered() {
+    let env = Env::new();
+    let (mut e, mc, p) = cloud_setup(&env);
+    let cloud_before = mc.get(b());
+    let files_before = env.snapshot_bytes(b());
+    e.faults = Faults { crash_after_cloud: true, ..Default::default() };
+    let (tb, _) = e.active_target().unwrap();
+    assert!(e.apply_load(&p, &tb, &LoadOptions::default()).is_err());
+    assert_eq!(common::sens(&mc.get(b())), 0.176, "upload happened before the crash");
+    drop(e);
+    // Next start, Riot Client not signed in yet: recovery waits.
+    let mut e2 = env.engine();
+    let rep = e2.recover().unwrap();
+    assert!(rep.deferred);
+    assert_eq!(e2.db.pending_ops().unwrap().len(), 1);
+    // Signed in as B: recovery restores account settings and files.
+    e2.set_cloud(Box::new(mc.clone()));
+    let rep = e2.recover().unwrap();
+    assert_eq!(rep.recovered_ops.len(), 1);
+    assert_eq!(mc.get(b()), cloud_before);
+    assert_eq!(env.snapshot_bytes(b()), files_before);
+}
+
+#[test]
+fn cloud_restore_requires_the_right_sign_in() {
+    let env = Env::new();
+    let (mut e, mc, p) = cloud_setup(&env);
+    let (tb, _) = e.active_target().unwrap();
+    e.apply_load(&p, &tb, &LoadOptions::default()).unwrap();
+    mc.sign_in(a());
+    // B's undo can't run while A is signed in (would hit the wrong account).
+    assert!(e.undo(b(), true).is_err());
+    assert_eq!(common::sens(&mc.get(a())), 0.176);
+}
+
+#[test]
+fn account_without_local_folder_gets_cloud_settings() {
+    let env = Env::new();
+    let (mut e, mc, p) = cloud_setup(&env);
+    let c = "cccccccc-3333-4333-8333-333333333333";
+    mc.set(c, valsync::cloud::sample_doc(0.9, "x"));
+    mc.sign_in(c);
+    let (tc, m) = e.active_target().unwrap();
+    assert_eq!((tc.puuid.as_str(), m), (c, DetectMethod::RiotClient));
+    assert!(!tc.dir.exists());
+    let out = e.apply_load(&p, &tc, &LoadOptions::default()).unwrap();
+    assert!(out.plan.warnings.iter().any(|w| w.contains("Video settings were skipped")));
+    assert_eq!(common::sens(&mc.get(c)), 0.176);
+    assert!(!tc.dir.exists(), "no folder is invented for the game");
+    e.undo(c, false).unwrap();
+    assert_eq!(common::sens(&mc.get(c)), 0.9);
+}
+
+#[test]
+fn profile_with_cloud_exports_and_imports() {
+    let env = Env::new();
+    let (e, _mc, p) = cloud_setup(&env);
+    let json = p.to_file_json().unwrap();
+    assert!(!json.contains(a()) && !json.contains(b()));
+    let (back, removed) = Profile::from_file_json(&json).unwrap();
+    assert_eq!(removed, 0);
+    assert_eq!(back.cloud, p.cloud);
+    let d = valsync::profile::compare(&p, &e.db.profile("Main").unwrap().unwrap().profile);
+    assert!(d.cloud.is_empty());
 }

@@ -24,15 +24,15 @@ fn every_screen_renders() {
     let cases: Vec<(Vec<KeyCode>, &str)> = vec![
         (vec![KeyCode::Char('1')], "Profile name"),
         (vec![KeyCode::Char('2')], "Load Saved Settings"),
-        (vec![KeyCode::Char('2'), KeyCode::Enter], "Select categories"),
-        (vec![KeyCode::Char('2'), KeyCode::Enter, KeyCode::Enter], "change(s)"),
-        (vec![KeyCode::Char('2'), KeyCode::Enter, KeyCode::Enter, KeyCode::Enter], "Apply"),
-        (vec![KeyCode::Char('2'), KeyCode::Enter, KeyCode::Enter, KeyCode::Enter, KeyCode::Char('y')], "Applied and verified"),
+        (vec![KeyCode::Char('2'), KeyCode::Enter], "change(s)"),
+        (vec![KeyCode::Char('2'), KeyCode::Enter, KeyCode::Char('c')], "Select categories"),
+        (vec![KeyCode::Char('2'), KeyCode::Enter, KeyCode::Enter], "Apply"),
+        (vec![KeyCode::Char('2'), KeyCode::Enter, KeyCode::Enter, KeyCode::Char('y')], "Applied and verified"),
         (vec![KeyCode::Char('3')], "Restore Previous Settings"),
         (vec![KeyCode::Char('3'), KeyCode::Char('u')], "Preview restore"),
         (vec![KeyCode::Char('4')], "Manage Settings Profiles"),
         (vec![KeyCode::Char('4'), KeyCode::Enter], "Profile 'Main'"),
-        (vec![KeyCode::Char('5')], "Manage Riot Accounts"),
+        (vec![KeyCode::Char('5')], "Riot Accounts"),
         (vec![KeyCode::Char('6')], "Live Match"),
         (vec![KeyCode::Char('7')], "Match History"),
         (vec![KeyCode::Char('8')], "Backup History"),
@@ -60,9 +60,25 @@ fn undo_through_tui_restores_files() {
         e.save_profile(&t, "Main", false, None, None, vec![]).unwrap();
     }
     env.switch_to(b());
-    render(&env, &[KeyCode::Char('2'), KeyCode::Enter, KeyCode::Enter, KeyCode::Enter, KeyCode::Char('y')], 120, 40);
+    render(&env, &[KeyCode::Char('2'), KeyCode::Enter, KeyCode::Enter, KeyCode::Char('y')], 120, 40);
     assert!(env.gus(b()).contains("ResolutionSizeX=1920"));
     let s = render(&env, &[KeyCode::Char('3'), KeyCode::Char('u'), KeyCode::Enter, KeyCode::Char('y')], 120, 40);
     assert!(s.contains("restored and verified"), "{s}");
     assert!(env.gus(b()).contains("ResolutionSizeX=1280"));
+}
+
+#[test]
+#[ignore]
+fn print_screens_with_cloud() {
+    let env = Env::new();
+    let (mut e, mc) = env.engine_with_cloud();
+    let (t, _) = e.active_target().unwrap();
+    e.save_profile(&t, "Main", false, None, None, vec![]).unwrap();
+    env.switch_to(b());
+    mc.sign_in(b());
+    for keys in [vec![], vec![KeyCode::Char('2'), KeyCode::Enter], vec![KeyCode::Char('1'), KeyCode::Enter, KeyCode::Char('y')]] {
+        let (s, e2) = valsync::tui::render_headless(e, &keys, 110, 36).unwrap();
+        e = e2;
+        println!("{s}\n=====");
+    }
 }

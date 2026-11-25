@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub const FORMAT_ID: &str = "valsync-profile";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SettingEntry {
@@ -56,12 +56,17 @@ pub struct Profile {
     pub settings: Vec<SettingEntry>,
     #[serde(default)]
     pub manual: Vec<ManualValue>,
+    /// Account settings stored by Riot (sensitivity, crosshair, keybinds, …),
+    /// machine-specific entries removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct CaptureReport {
     pub files: usize,
     pub local: usize,
+    /// Account settings (from Riot, or old local cache copies when offline).
     pub cloud: usize,
     pub excluded: usize,
     pub excluded_reasons: BTreeMap<&'static str, usize>,
@@ -107,12 +112,29 @@ impl Profile {
             notes: None,
             settings,
             manual: Vec::new(),
+            cloud: None,
         };
         (profile, rep)
     }
 
+    /// Attach cloud settings; the stale local cache copies of them are dropped.
+    pub fn set_cloud(&mut self, cloud: &serde_json::Value) {
+        self.cloud = Some(crate::cloud::sanitize(cloud));
+        self.settings.retain(|s| s.scope == Scope::Local);
+    }
+
+    pub fn cloud_count(&self) -> usize {
+        self.cloud.as_ref().map(|c| crate::cloud::category_counts(c).values().sum()).unwrap_or(0)
+    }
+
+    /// Per category: (local file settings, account/cloud settings).
     pub fn categories(&self) -> BTreeMap<Category, (usize, usize)> {
         let mut m: BTreeMap<Category, (usize, usize)> = BTreeMap::new();
+        if let Some(c) = &self.cloud {
+            for (cat, n) in crate::cloud::category_counts(c) {
+                m.entry(cat).or_default().1 += n;
+            }
+        }
         for s in &self.settings {
             let e = m.entry(s.category).or_default();
             match s.scope {
@@ -151,7 +173,18 @@ impl Profile {
                 s.scope = scope;
             }
         }
-        before - self.settings.len()
+        let mut removed = before - self.settings.len();
+        if let Some(c) = &self.cloud {
+            if !c.is_object() {
+                self.cloud = None;
+                removed += 1;
+            } else {
+                let clean = crate::cloud::sanitize(c);
+                removed += crate::cloud::entries(c).len() - crate::cloud::entries(&clean).len();
+                self.cloud = Some(clean);
+            }
+        }
+        removed
     }
 
     pub fn to_file_json(&self) -> Result<String> {
@@ -198,6 +231,8 @@ pub struct ProfileDiff {
     pub only_a: Vec<SettingEntry>,
     pub only_b: Vec<SettingEntry>,
     pub same: usize,
+    /// Differences in account (cloud) settings, `a` → `b`.
+    pub cloud: Vec<crate::engine::Change>,
 }
 
 pub fn compare(a: &Profile, b: &Profile) -> ProfileDiff {
@@ -215,6 +250,11 @@ pub fn compare(a: &Profile, b: &Profile) -> ProfileDiff {
         if !amap.contains_key(&s.id()) {
             d.only_b.push(s.clone());
         }
+    }
+    let empty = serde_json::Value::Object(Default::default());
+    if a.cloud.is_some() || b.cloud.is_some() {
+        d.cloud = crate::cloud::diff(a.cloud.as_ref().unwrap_or(&empty), b.cloud.as_ref().unwrap_or(&empty));
+        d.same += crate::cloud::entries(a.cloud.as_ref().unwrap_or(&empty)).len().saturating_sub(d.cloud.len());
     }
     d
 }

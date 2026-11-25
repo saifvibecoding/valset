@@ -69,3 +69,22 @@ pub fn a() -> &'static str {
 pub fn b() -> &'static str {
     PUUID_B
 }
+
+impl Env {
+    /// Engine with an in-memory Riot account-settings backend (A signed in).
+    pub fn engine_with_cloud(&self) -> (Engine, valsync::cloud::MemCloud) {
+        let mc = valsync::cloud::MemCloud::default();
+        mc.set(PUUID_A, valsync::cloud::sample_doc(0.176, "0;P;c;5"));
+        let mut b = valsync::cloud::sample_doc(0.25, "0;P;h;0");
+        b["stringSettings"][1]["value"] = serde_json::json!("device-of-B");
+        mc.set(PUUID_B, b);
+        mc.sign_in(PUUID_A);
+        let mut e = self.engine();
+        e.set_cloud(Box::new(mc.clone()));
+        (e, mc)
+    }
+}
+
+pub fn sens(doc: &serde_json::Value) -> f64 {
+    doc["floatSettings"].as_array().unwrap().iter().find(|e| e["settingEnum"] == "EAresFloatSettingName::MouseSensitivity").unwrap()["value"].as_f64().unwrap()
+}

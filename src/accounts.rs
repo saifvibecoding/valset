@@ -30,6 +30,8 @@ pub struct LocalAccount {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectMethod {
+    /// The account signed into the Riot Client right now.
+    RiotClient,
     /// `RiotLocalMachine.ini` LastKnownUser (VALORANT's own record).
     LastKnownUser,
     /// User-selected fallback, validated against a local config folder.
@@ -43,7 +45,8 @@ pub enum DetectMethod {
 impl DetectMethod {
     pub fn label(self) -> &'static str {
         match self {
-            DetectMethod::LastKnownUser => "detected (VALORANT last user)",
+            DetectMethod::RiotClient => "signed in to the Riot Client",
+            DetectMethod::LastKnownUser => "last account that played on this PC",
             DetectMethod::Manual => "manual selection",
             DetectMethod::SingleFolder => "detected (only account)",
             DetectMethod::MostRecentFolder => "guessed (most recent folder) — please confirm",

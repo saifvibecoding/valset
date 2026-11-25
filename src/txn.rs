@@ -122,6 +122,8 @@ pub struct Faults {
     /// Write garbage instead of the intended content for write `n` (e.g. an
     /// antivirus or the game rewriting the file) so verification must catch it.
     pub corrupt_write: Option<usize>,
+    /// Simulate a crash right after the account settings were uploaded.
+    pub crash_after_cloud: bool,
 }
 
 #[derive(Debug)]

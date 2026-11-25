@@ -71,12 +71,18 @@ pub fn run(_ctx: &mut Ctx) -> Result<()> {
         let open = time(1, || Engine::open(paths.clone()))?;
         let db = Db::open(&paths.db_path())?;
         let mut e = Engine::with_parts(paths.clone(), db, AppConfig::default(), ProcessProbe::Fixed(vec![]));
+        let mc = crate::cloud::MemCloud::default();
+        mc.set(sample::PUUID_A, crate::cloud::sample_doc(0.176, "0;P;c;5"));
+        mc.set(sample::PUUID_B, crate::cloud::sample_doc(0.25, "0;P;h;0"));
+        mc.sign_in(sample::PUUID_A);
+        e.set_cloud(Box::new(mc.clone()));
         let ta = Target { puuid: sample::PUUID_A.into(), folder: format!("{}-eu", sample::PUUID_A), dir: config.join(format!("{}-eu", sample::PUUID_A)) };
         let tb = Target { puuid: sample::PUUID_B.into(), folder: format!("{}-eu", sample::PUUID_B), dir: dir_b.clone() };
         let status = time(20, || crate::service::status(&e).map(|_| ()))?;
         let capture = time(50, || e.capture(&ta, "bench", None).map(|_| ()))?;
         e.save_profile(&ta, "bench", true, None, None, vec![])?;
         let p = e.db.profile("bench")?.expect("saved").profile;
+        mc.sign_in(sample::PUUID_B);
         let plan = time(50, || e.plan_load(&p, &tb, &LoadOptions::default()).map(|_| ()))?;
         let mut cycle = Duration::ZERO;
         let mut undo = Duration::ZERO;
@@ -98,7 +104,7 @@ pub fn run(_ctx: &mut Ctx) -> Result<()> {
         println!("  Status dashboard refresh           {}", fmt(status));
         println!("  Capture profile                    {}", fmt(capture));
         println!("  Plan transfer (diff)               {}", fmt(plan));
-        println!("  Transfer: backup+write+verify      {}", fmt(cycle / iters));
+        println!("  Transfer: backup+write+verify      {}  (account settings via in-memory stand-in)", fmt(cycle / iters));
         println!("  Undo (restore + verify)            {}", fmt(undo / iters));
         println!("  Verify backup integrity            {}", fmt(verify));
         match peak_rss_bytes() {

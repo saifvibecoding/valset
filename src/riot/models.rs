@@ -1,38 +1,45 @@
-//! Riot API DTOs (only the fields VALSYNC uses; unknown fields are ignored and
-//! missing ones default, so API additions never break parsing).
+//! Data shapes returned by the Riot Client and Riot's game services. Every
+//! field is optional/defaulted so a format change never breaks parsing.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// ----------------------------------------------------------------- local client
+
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub struct AccountDto {
+pub struct Entitlements {
+    pub access_token: String,
+    /// Entitlements JWT.
+    pub token: String,
+    /// PUUID of the signed-in account.
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ChatSession {
+    pub game_name: String,
+    pub game_tag: String,
     pub puuid: String,
-    pub game_name: Option<String>,
-    pub tag_line: Option<String>,
+    pub region: String,
+    pub loaded: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub struct ActiveShardDto {
-    pub puuid: String,
-    pub game: String,
-    pub active_shard: String,
+pub struct ExternalSession {
+    pub product_id: String,
+    pub launch_configuration: Option<LaunchConfiguration>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Matchlist {
-    pub puuid: String,
-    pub history: Vec<MatchlistEntry>,
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LaunchConfiguration {
+    pub arguments: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct MatchlistEntry {
-    pub match_id: String,
-    pub game_start_time_millis: i64,
-    pub queue_id: String,
-}
+// ----------------------------------------------------------------- pd: match details (same shape as VAL-MATCH-V1)
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -63,7 +70,8 @@ pub struct MatchInfo {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Player {
-    pub puuid: String,
+    #[serde(alias = "puuid")]
+    pub subject: String,
     pub game_name: String,
     pub tag_line: String,
     pub team_id: String,
@@ -107,7 +115,8 @@ pub struct RoundResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PlayerRoundStats {
-    pub puuid: String,
+    #[serde(alias = "puuid")]
+    pub subject: String,
     pub damage: Vec<Damage>,
     pub score: i32,
 }
@@ -122,89 +131,281 @@ pub struct Damage {
     pub headshots: i32,
 }
 
+// ----------------------------------------------------------------- pd: other
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct MatchHistory {
+    pub subject: String,
+    pub history: Vec<MatchHistoryEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MatchHistoryEntry {
+    #[serde(rename = "MatchID")]
+    pub match_id: String,
+    #[serde(rename = "GameStartTime")]
+    pub game_start_time: i64,
+    #[serde(rename = "QueueID")]
+    pub queue_id: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct ContentItem {
-    pub name: String,
+#[serde(default, rename_all = "PascalCase")]
+pub struct Mmr {
+    pub queue_skills: HashMap<String, QueueSkill>,
+    pub latest_competitive_update: Option<CompetitiveUpdate>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct QueueSkill {
+    #[serde(rename = "SeasonalInfoBySeasonID")]
+    pub seasonal_info_by_season_id: Option<HashMap<String, SeasonalInfo>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct SeasonalInfo {
+    #[serde(rename = "SeasonID")]
+    pub season_id: String,
+    pub number_of_wins: i32,
+    pub number_of_games: i32,
+    pub rank: i32,
+    pub competitive_tier: i32,
+    pub ranked_rating: i32,
+    pub wins_by_tier: Option<HashMap<String, i32>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct CompetitiveUpdate {
+    #[serde(rename = "MatchID")]
+    pub match_id: String,
+    #[serde(rename = "SeasonID")]
+    pub season_id: String,
+    pub tier_after_update: i32,
+    pub ranked_rating_after_update: i32,
+    pub ranked_rating_earned: i32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct NameEntry {
+    pub subject: String,
+    pub game_name: String,
+    pub tag_line: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct AccountXp {
+    pub progress: XpProgress,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct XpProgress {
+    pub level: i32,
+}
+
+// ----------------------------------------------------------------- glz: live match
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CurrentMatchRef {
+    #[serde(rename = "MatchID")]
+    pub match_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PlayerIdentity {
+    #[serde(rename = "Subject")]
+    pub subject: String,
+    #[serde(rename = "AccountLevel")]
+    pub account_level: i32,
+    #[serde(rename = "Incognito")]
+    pub incognito: bool,
+    #[serde(rename = "HideAccountLevel")]
+    pub hide_account_level: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CoreGameMatch {
+    #[serde(rename = "MatchID")]
+    pub match_id: String,
+    #[serde(rename = "State")]
+    pub state: String,
+    #[serde(rename = "MapID")]
+    pub map_id: String,
+    #[serde(rename = "ModeID")]
+    pub mode_id: String,
+    #[serde(rename = "MatchmakingData")]
+    pub matchmaking_data: Option<MatchmakingData>,
+    #[serde(rename = "Players")]
+    pub players: Vec<CoreGamePlayer>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MatchmakingData {
+    #[serde(rename = "QueueID")]
+    pub queue_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CoreGamePlayer {
+    #[serde(rename = "Subject")]
+    pub subject: String,
+    #[serde(rename = "TeamID")]
+    pub team_id: String,
+    #[serde(rename = "CharacterID")]
+    pub character_id: String,
+    #[serde(rename = "PlayerIdentity")]
+    pub player_identity: PlayerIdentity,
+    #[serde(rename = "IsCoach")]
+    pub is_coach: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PregameMatch {
+    #[serde(rename = "ID")]
     pub id: String,
-    pub asset_name: String,
-    pub asset_path: Option<String>,
+    #[serde(rename = "MapID")]
+    pub map_id: String,
+    #[serde(rename = "QueueID")]
+    pub queue_id: String,
+    #[serde(rename = "Mode")]
+    pub mode: String,
+    #[serde(rename = "AllyTeam")]
+    pub ally_team: Option<PregameTeam>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Act {
-    pub name: String,
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PregameTeam {
+    #[serde(rename = "TeamID")]
+    pub team_id: String,
+    #[serde(rename = "Players")]
+    pub players: Vec<PregamePlayer>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PregamePlayer {
+    #[serde(rename = "Subject")]
+    pub subject: String,
+    #[serde(rename = "CharacterID")]
+    pub character_id: String,
+    #[serde(rename = "CharacterSelectionState")]
+    pub character_selection_state: String,
+    #[serde(rename = "PlayerIdentity")]
+    pub player_identity: PlayerIdentity,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Loadouts {
+    #[serde(rename = "Loadouts")]
+    pub loadouts: Vec<PlayerLoadout>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PlayerLoadout {
+    #[serde(rename = "CharacterID")]
+    pub character_id: String,
+    #[serde(rename = "Loadout")]
+    pub loadout: Loadout,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Loadout {
+    #[serde(rename = "Subject")]
+    pub subject: String,
+    #[serde(rename = "Items")]
+    pub items: HashMap<String, LoadoutItem>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LoadoutItem {
+    #[serde(rename = "ID")]
     pub id: String,
-    pub is_active: bool,
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
+    #[serde(rename = "Sockets")]
+    pub sockets: HashMap<String, Socket>,
 }
 
-/// VAL-CONTENT-V1, reduced to what VALSYNC needs (the full payload is large).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Content {
-    pub version: String,
-    pub characters: Vec<ContentItem>,
-    pub maps: Vec<ContentItem>,
-    pub game_modes: Vec<ContentItem>,
-    pub acts: Vec<Act>,
-}
-
-impl Content {
-    pub fn agent_name(&self, id: &str) -> Option<String> {
-        self.characters.iter().find(|c| c.id.eq_ignore_ascii_case(id)).map(|c| c.name.clone())
-    }
-    pub fn map_name(&self, map_id: &str) -> Option<String> {
-        self.maps
-            .iter()
-            .find(|m| m.asset_path.as_deref().map(|p| p.eq_ignore_ascii_case(map_id)).unwrap_or(false) || m.id.eq_ignore_ascii_case(map_id))
-            .map(|m| m.name.clone())
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct PlatformData {
+pub struct Socket {
+    #[serde(rename = "Item")]
+    pub item: SocketItem,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SocketItem {
+    #[serde(rename = "ID")]
     pub id: String,
-    pub name: String,
-    pub maintenances: Vec<StatusEntry>,
-    pub incidents: Vec<StatusEntry>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StatusEntry {
-    pub id: serde_json::Value,
-    pub maintenance_status: Option<String>,
-    pub incident_severity: Option<String>,
-    pub titles: Vec<LocalizedText>,
-}
+pub const WEAPON_VANDAL: &str = "9c82e19d-4575-0200-1a81-3eacf00cf872";
+pub const WEAPON_PHANTOM: &str = "ee8e8d15-496b-07ac-e5f6-8fae5d4c7b1a";
+pub const SOCKET_SKIN: &str = "bcef87d6-209b-46c6-8b19-fbe40bd95abc";
+pub const SOCKET_CHROMA: &str = "3ad1b2b2-acdb-4524-852f-954a76ddae0a";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LocalizedText {
-    pub locale: String,
-    pub content: String,
-}
+/// Seasons before Ascendant was added: tiers above 20 must be shifted by 3.
+pub const PRE_ASCENDANT_SEASONS: [&str; 12] = [
+    "0df5adb9-4dcb-6899-1306-3e9860661dd3",
+    "3f61c772-4560-cd3f-5d3f-a7ab5abda6b3",
+    "0530b9c4-4980-f2ee-df5d-09864cd00542",
+    "46ea6166-4573-1128-9cea-60a15640059b",
+    "fcf2c8f4-4324-e50b-2e23-718e4a3ab046",
+    "97b6e739-44cc-ffa7-49ad-398ba502ceb0",
+    "ab57ef51-4e59-da91-cc7d-51a5a2b9b8ff",
+    "52e9749a-429b-7060-99fe-4595426a0cf7",
+    "71c81c67-4fae-ceb1-844c-aab2bb8710fa",
+    "2a27e5d2-4d30-c9e2-b15a-93b8909a442c",
+    "4cb622e1-4244-6f41-a05f-2c7b300ee8fc",
+    "a16955a5-4ad0-f761-5e9e-389df1c892fb",
+];
 
-impl StatusEntry {
-    pub fn title(&self, locale: &str) -> String {
-        let want = locale.replace('-', "_");
-        self.titles
-            .iter()
-            .find(|t| t.locale.eq_ignore_ascii_case(&want) || t.locale.eq_ignore_ascii_case(locale))
-            .or_else(|| self.titles.first())
-            .map(|t| t.content.clone())
-            .unwrap_or_else(|| "(untitled)".into())
+impl Mmr {
+    /// (current tier, current RR) from the latest competitive update.
+    pub fn current(&self) -> Option<(i32, i32)> {
+        let u = self.latest_competitive_update.as_ref()?;
+        if u.tier_after_update > 0 { Some((u.tier_after_update, u.ranked_rating_after_update)) } else { None }
+    }
+
+    /// Highest tier with at least one recorded win across all acts.
+    pub fn peak_tier(&self) -> Option<i32> {
+        let seasons = self.queue_skills.get("competitive")?.seasonal_info_by_season_id.as_ref()?;
+        let mut best = 0;
+        for (id, s) in seasons {
+            let shift = |t: i32| if PRE_ASCENDANT_SEASONS.contains(&id.as_str()) && t > 20 { t + 3 } else { t };
+            for (tier, wins) in s.wins_by_tier.iter().flatten() {
+                if let Ok(t) = tier.parse::<i32>()
+                    && *wins > 0
+                {
+                    best = best.max(shift(t));
+                }
+            }
+            best = best.max(shift(s.competitive_tier.max(s.rank)));
+        }
+        if best > 2 { Some(best) } else { None }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TokenResponse {
-    pub access_token: String,
-    pub token_type: String,
-    pub expires_in: i64,
+impl Match {
+    /// pd match details use `subject`; normalise access.
+    pub fn player(&self, puuid: &str) -> Option<&Player> {
+        self.players.iter().find(|p| p.subject == puuid)
+    }
 }

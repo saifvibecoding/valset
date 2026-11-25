@@ -6,6 +6,7 @@
 pub mod accounts;
 pub mod appconfig;
 pub mod catalog;
+pub mod cloud;
 pub mod db;
 pub mod engine;
 pub mod game;

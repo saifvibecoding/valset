@@ -80,13 +80,13 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Text(_) => hints(&[("↑↓/PgUp/PgDn", "scroll"), ("Esc", "back")]),
         Screen::Load(st) => match st.stage {
             LoadStage::Profiles => hints(&[("↑↓", "move"), ("Enter", "choose profile"), ("Esc", "back")]),
-            LoadStage::Categories => hints(&[("Space", "toggle"), ("a", "all/none"), ("Enter", "preview"), ("Esc", "back")]),
-            LoadStage::Preview => hints(&[("↑↓", "scroll"), ("Enter", "apply"), ("Esc", "back")]),
+            LoadStage::Categories => hints(&[("Space", "toggle"), ("a", "all/none"), ("Enter", "done"), ("Esc", "back")]),
+            LoadStage::Preview => hints(&[("Enter", "apply"), ("c", "choose categories"), ("↑↓", "scroll"), ("Esc", "back")]),
         },
         Screen::Restore(st) if st.preview.is_some() => hints(&[("↑↓", "scroll"), ("Enter", "restore"), ("Esc", "back")]),
         Screen::Restore(_) => hints(&[("↑↓", "move"), ("Enter", "preview"), ("u", "undo"), ("r", "redo"), ("Esc", "back")]),
         Screen::Profiles(_) => hints(&[("Enter", "view"), ("r", "rename"), ("d", "dup"), ("x", "del"), ("f", "fav"), ("c", "compare"), ("e", "export"), ("i", "import"), ("p", "prefer"), ("v", "check")]),
-        Screen::Accounts(_) => hints(&[("s", "select"), ("n", "Riot ID"), ("i", "lookup"), ("l", "RSO link"), ("u", "unlink"), ("p", "prefer"), ("a", "auto"), ("x", "forget")]),
+        Screen::Accounts(_) => hints(&[("p", "preferred profile"), ("x", "forget"), ("Esc", "back")]),
         Screen::Live(_) => hints(&[("r", "refresh"), ("Esc", "back")]),
         Screen::History(_) => hints(&[("↑↓", "move"), ("Enter", "details"), ("r", "refresh"), ("Esc", "back")]),
         Screen::Backups(_) => hints(&[("Enter", "preview/restore"), ("v", "verify"), ("V", "verify all"), ("m", "manual backup"), ("x", "delete"), ("a", "all accounts")]),
@@ -177,13 +177,18 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
         ),
         None => (
             Line::from(vec![label("Active account"), Span::styled("none detected", Style::new().fg(Color::Yellow))]),
-            Line::from(vec![label("Detection"), Span::styled("launch VALORANT once with the account", Style::new().fg(MUTED))]),
+            Line::from(vec![label("Detection"), Span::styled("open the Riot Client and sign in", Style::new().fg(MUTED))]),
         ),
+    };
+    let riot = if s.riot_signed_in {
+        Line::from(vec![label("Riot Client"), dot(true, false), Span::raw(" signed in")])
+    } else {
+        Line::from(vec![label("Riot Client"), dot(false, false), Span::styled(" open it and sign in", Style::new().fg(Color::Yellow))])
     };
     let left_lines = vec![
         acct,
         method,
-        Line::from(vec![label("Riot Client"), dot(s.processes.riot_client, false), Span::raw(if s.processes.riot_client { " connected (running)" } else { " not running" })]),
+        riot,
         Line::from(vec![
             label("VALORANT"),
             dot(s.processes.valorant, true),
@@ -203,7 +208,6 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("  "),
             Span::styled(if s.redo_available { "redo ✔" } else { "redo —" }, Style::new().fg(if s.redo_available { Color::Green } else { MUTED })),
         ]),
-        Line::from(vec![label("Riot API"), Span::styled(if s.api_key { "key configured" } else { "no key (offline features only)" }, Style::new().fg(if s.api_key { Color::Green } else { MUTED }))]),
     ];
     f.render_widget(Paragraph::new(right_lines).block(block("Library")), right);
 
@@ -266,7 +270,7 @@ fn draw_load(f: &mut Frame, app: &App, st: &LoadState, area: Rect) {
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(format!("Profile '{}' → {target}", st.profiles[st.sel].name)),
-                    Line::from(Span::styled("Cloud-synced categories go to a manual checklist unless 'write_cloud_cache' is enabled.", Style::new().fg(MUTED))),
+                    Line::from(Span::styled("Pick what to copy. Everything is selected by default.", Style::new().fg(MUTED))),
                 ])
                 .block(Block::default()),
                 info,
@@ -275,12 +279,10 @@ fn draw_load(f: &mut Frame, app: &App, st: &LoadState, area: Rect) {
                 .cats
                 .iter()
                 .map(|(c, l, cl, on)| {
-                    let support = if *l > 0 { Span::styled("transfer", Style::new().fg(Color::Green)) } else { Span::styled("manual (cloud)", Style::new().fg(Color::Yellow)) };
                     ListItem::new(Line::from(vec![
                         Span::styled(if *on { " [x] " } else { " [ ] " }, Style::new().fg(ACCENT)),
                         Span::raw(format!("{:<26}", c.label())),
-                        Span::styled(format!("local {l:<4} cloud {cl:<4} "), Style::new().fg(MUTED)),
-                        support,
+                        Span::styled(format!("{} setting(s)", l + cl), Style::new().fg(MUTED)),
                     ]))
                 })
                 .collect();
@@ -290,7 +292,7 @@ fn draw_load(f: &mut Frame, app: &App, st: &LoadState, area: Rect) {
         LoadStage::Preview => {
             let Some(plan) = &st.plan else { return };
             let mut lines = Vec::new();
-            if let Some(w) = &plan.patch_warning {
+            for w in plan.warnings.iter().chain(plan.patch_warning.iter()) {
                 lines.push(styled(format!("! {w}"), Style::new().fg(Color::Yellow)));
             }
             if app.status.processes.valorant {
@@ -298,7 +300,7 @@ fn draw_load(f: &mut Frame, app: &App, st: &LoadState, area: Rect) {
             }
             lines.push(Line::from(vec![
                 Span::styled(format!("{} change(s)", plan.changes.len()), Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(format!(" in {} file(s) · {} already matching · {} new key(s) · {} manual (cloud)", plan.ops.len(), plan.unchanged, plan.new_keys, plan.manual.len())),
+                Span::raw(format!(" will be applied · {} already match", plan.unchanged)),
             ]));
             lines.push(Line::from(""));
             if plan.changes.is_empty() {
@@ -390,39 +392,27 @@ fn draw_accounts(f: &mut Frame, st: &AccountsState, area: Rect) {
     let rows: Vec<Row> = st
         .rows
         .iter()
-        .map(|(a, local, active)| {
-            let (ident, c) = match (a.source.as_str(), a.verified) {
-                ("rso", _) => ("RSO verified", Color::Green),
-                (_, true) => ("API verified", Color::Green),
-                ("manual", false) => ("manual (unverified)", Color::Yellow),
-                _ => ("local folder", MUTED),
-            };
+        .map(|(a, _, active)| {
             Row::new(vec![
                 Cell::from(if *active { "▶" } else { " " }).style(Style::new().fg(Color::Green)),
-                Cell::from(a.riot_id().unwrap_or_else(|| "(Riot ID unknown — press n)".into())),
+                Cell::from(a.riot_id().unwrap_or_else(|| "(name appears after you sign in)".into())),
                 Cell::from(a.shard.clone().unwrap_or_else(|| "?".into()).to_uppercase()),
-                Cell::from(crate::db::short_id(&a.puuid)),
-                Cell::from(if *local { "yes" } else { "no" }),
-                Cell::from(ident).style(Style::new().fg(c)),
-                Cell::from(if a.consent { "yes" } else { "no" }).style(Style::new().fg(if a.consent { Color::Green } else { MUTED })),
                 Cell::from(a.preferred_profile.clone().unwrap_or_else(|| "—".into())),
+                Cell::from(crate::term::local_time(&a.last_seen)).style(Style::new().fg(MUTED)),
             ])
         })
         .collect();
-    let [tarea, note] = Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(area);
-    let t = Table::new(
-        rows,
-        [Constraint::Length(2), Constraint::Min(22), Constraint::Length(6), Constraint::Length(9), Constraint::Length(6), Constraint::Length(20), Constraint::Length(8), Constraint::Min(10)],
-    )
-    .header(header(&["", "Riot ID", "Shard", "PUUID", "Local", "Identity", "RSO", "Preferred"]))
-    .row_highlight_style(sel_style())
-    .block(block("Manage Riot Accounts"));
+    let [tarea, note] = Layout::vertical([Constraint::Min(4), Constraint::Length(2)]).areas(area);
+    let t = Table::new(rows, [Constraint::Length(2), Constraint::Min(24), Constraint::Length(7), Constraint::Min(16), Constraint::Length(20)])
+        .header(header(&["", "Riot ID", "Region", "Preferred profile", "Last seen"]))
+        .row_highlight_style(sel_style())
+        .block(block("Riot Accounts"));
     f.render_stateful_widget(t, tarea, &mut table_state(st.sel));
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled("Switch accounts normally in the Riot Client, then launch VALORANT once; VALSYNC detects the switch automatically.", Style::new().fg(MUTED))),
-            Line::from(Span::styled("VALSYNC never asks for passwords and never reads Riot Client session files or tokens.", Style::new().fg(MUTED))),
-        ])
+        Paragraph::new(Line::from(Span::styled(
+            "Switch accounts in the Riot Client as usual — VALSYNC follows automatically. It never asks for your password.",
+            Style::new().fg(MUTED),
+        )))
         .wrap(Wrap { trim: true }),
         note,
     );
@@ -443,10 +433,14 @@ fn na() -> Cell<'static> {
     Cell::from("N/A").style(Style::new().fg(MUTED))
 }
 
-/// 5v5 table. `owner_stats` adds profile-level columns for the consenting owner.
+fn opt_cell(v: Option<String>) -> Cell<'static> {
+    v.map(Cell::from).unwrap_or_else(na)
+}
+
+/// 5-row team table. Rank/RR/peak/K/D/HS/WR are shown for you only.
 fn team_table(players: &[PlayerLine], title: String, owner: Option<&crate::matches::OwnerStats>, width: u16, live: bool) -> Table<'static> {
     let wide = width >= 150;
-    let mut cols = vec!["Riot ID", "Agent", "Rank", "Peak", "RR", "Lvl", "K/D", "HS%", "WR", "Vandal", "Phantom"];
+    let mut cols = vec!["Player", "Agent", "Rank", "RR", "Peak", "Lvl", if live { "K/D" } else { "K/D/A" }, "HS%", "WR", "Vandal", "Phantom"];
     if wide {
         cols.insert(5, "Peak RR");
         cols.push("Variant");
@@ -454,44 +448,52 @@ fn team_table(players: &[PlayerLine], title: String, owner: Option<&crate::match
     let rows: Vec<Row> = (0..5)
         .map(|i| match players.get(i) {
             Some(p) => {
-                let is_owner = p.is_owner;
+                let me = if p.is_owner { owner } else { None };
                 let mut cells = vec![
-                    Cell::from(p.name.clone()).style(if is_owner { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() }),
+                    Cell::from(p.name.clone()).style(if p.is_owner { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() }),
                     Cell::from(p.agent.clone()),
-                    tier_cell(if live && is_owner { owner.and_then(|o| o.current_tier) } else { p.tier }),
-                    if is_owner { tier_cell(owner.and_then(|o| o.peak_tier)) } else { na() },
-                    na(),
+                    tier_cell(me.and_then(|o| o.current_tier).or(p.tier)),
+                    opt_cell(me.and_then(|o| o.rr).map(|r| r.to_string())),
+                    tier_cell(me.and_then(|o| o.peak_tier)),
                 ];
                 if wide {
                     cells.push(na());
                 }
-                cells.push(p.level.or_else(|| if is_owner { owner.and_then(|o| o.level) } else { None }).map(|l| Cell::from(l.to_string())).unwrap_or_else(na));
+                cells.push(opt_cell(p.level.or(me.and_then(|o| o.level)).map(|l| l.to_string())));
                 if live {
-                    let o = if is_owner { owner } else { None };
-                    cells.push(o.and_then(|o| o.kd()).map(|k| Cell::from(format!("{k:.2}"))).unwrap_or_else(na));
-                    cells.push(o.and_then(|o| o.hs_pct()).map(|h| Cell::from(format!("{h:.1}%"))).unwrap_or_else(na));
+                    cells.push(opt_cell(me.and_then(|o| o.kd()).map(|k| format!("{k:.2}"))));
+                    cells.push(opt_cell(me.and_then(|o| o.hs_pct()).map(|h| format!("{h:.1}%"))));
                 } else {
-                    cells.push(Cell::from(format!("{}/{}/{} ({:.2})", p.kills, p.deaths, p.assists, p.kills as f64 / p.deaths.max(1) as f64)));
-                    cells.push(p.hs_pct.map(|h| Cell::from(format!("{h:.1}%"))).unwrap_or_else(na));
+                    cells.push(Cell::from(format!("{}/{}/{}", p.kills, p.deaths, p.assists)));
+                    cells.push(opt_cell(p.hs_pct.map(|h| format!("{h:.1}%"))));
                 }
-                cells.push(if is_owner { owner.and_then(|o| o.win_rate()).map(|w| Cell::from(format!("{w:.0}%"))).unwrap_or_else(na) } else { na() });
-                cells.push(na());
-                cells.push(na());
+                cells.push(opt_cell(me.and_then(|o| o.win_rate()).map(|w| format!("{w:.0}%"))));
+                cells.push(opt_cell(p.vandal.clone()));
+                cells.push(opt_cell(p.phantom.clone()));
                 if wide {
-                    cells.push(na());
+                    cells.push(opt_cell(p.variant.clone()));
                 }
                 Row::new(cells)
             }
-            None => Row::new(cols.iter().enumerate().map(|(i, _)| if i == 0 { Cell::from("N/A").style(Style::new().fg(MUTED)) } else { na() }).collect::<Vec<_>>()),
+            None => Row::new(cols.iter().map(|_| Cell::from("")).collect::<Vec<_>>()),
         })
         .collect();
-    let mut widths = vec![Constraint::Min(18), Constraint::Length(10), Constraint::Length(12), Constraint::Length(12), Constraint::Length(4), Constraint::Length(4), Constraint::Length(17), Constraint::Length(6), Constraint::Length(5), Constraint::Length(8), Constraint::Length(8)];
+    let mut widths = vec![
+        Constraint::Min(18),
+        Constraint::Length(10),
+        Constraint::Length(12),
+        Constraint::Length(4),
+        Constraint::Length(12),
+        Constraint::Length(4),
+        Constraint::Length(if live { 5 } else { 9 }),
+        Constraint::Length(6),
+        Constraint::Length(4),
+        Constraint::Length(16),
+        Constraint::Length(16),
+    ];
     if wide {
         widths.insert(5, Constraint::Length(8));
-        widths.push(Constraint::Length(8));
-    }
-    if live {
-        widths[if wide { 7 } else { 6 }] = Constraint::Length(5);
+        widths.push(Constraint::Length(18));
     }
     Table::new(rows, widths).header(header(&cols)).block(block(title))
 }
@@ -503,8 +505,7 @@ fn draw_match(f: &mut Frame, v: &MatchView, owner: Option<&crate::matches::Owner
         Some(false) => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         None => Style::new(),
     };
-    let allies: Vec<&PlayerLine> = v.players.iter().filter(|p| p.is_ally).collect();
-    let comp: Vec<String> = allies.iter().map(|p| p.agent.clone()).collect();
+    let comp: Vec<String> = v.players.iter().filter(|p| p.is_ally).map(|p| p.agent.clone()).collect();
     f.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
@@ -513,7 +514,7 @@ fn draw_match(f: &mut Frame, v: &MatchView, owner: Option<&crate::matches::Owner
                 Span::styled(format!("{} {}", v.result_label(), v.score_line()), res_style),
                 Span::styled(format!("   {} · {}", matches::fmt_time(v.started_ms), matches::fmt_duration(v.duration_ms)), Style::new().fg(MUTED)),
             ]),
-            Line::from(Span::styled(format!("Team composition: {}", comp.join(", ")), Style::new().fg(MUTED))),
+            Line::from(Span::styled(format!("Your team: {}", comp.join(", ")), Style::new().fg(MUTED))),
         ]),
         info,
     );
@@ -524,76 +525,83 @@ fn draw_match(f: &mut Frame, v: &MatchView, owner: Option<&crate::matches::Owner
 }
 
 fn draw_live(f: &mut Frame, app: &App, st: &LiveState, area: Rect) {
-    let running = app.status.processes.valorant;
-    let [head, main] = Layout::vertical([Constraint::Length(5), Constraint::Min(10)]).areas(area);
-    let consent = app.status.active.as_ref().map(|a| a.0.consent).unwrap_or(false);
-    let next = st.last_fetch.map(|t| app.engine.config.poll_secs().saturating_sub(t.elapsed().as_secs())).unwrap_or(0);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("VALORANT ", Style::new().fg(MUTED)),
-            dot(running, false),
-            Span::raw(if running { " in game client" } else { " not running" }),
-            Span::styled("   Map (your client log): ", Style::new().fg(MUTED)),
-            Span::raw(st.map.as_deref().map(crate::game::map_display_name).unwrap_or_else(|| "N/A".into())),
-            Span::styled(
-                if st.loading { "   refreshing…".to_string() } else if running && consent { format!("   next refresh in {next}s") } else { String::new() },
-                Style::new().fg(MUTED),
+    let [head, main] = Layout::vertical([Constraint::Length(4), Constraint::Min(10)]).areas(area);
+    let next = st.last_fetch.map(|t| {
+        let every = if app.status.processes.valorant { app.engine.config.poll_secs() } else { 60 };
+        every.saturating_sub(t.elapsed().as_secs())
+    });
+    let view = st.data.as_ref().and_then(|d| d.view.as_ref());
+    let mut lines = vec![Line::from(vec![
+        Span::styled(st.data.as_ref().map(|d| d.account.clone()).unwrap_or_else(|| app.active_label()), Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        match view {
+            Some(v) => Span::styled(
+                format!("{} · {} · {}", if v.phase == matches::LivePhase::AgentSelect { "AGENT SELECT" } else { "IN GAME" }, v.map, v.mode),
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(Span::styled(
-            "Riot provides no supported live-match API for VALORANT: other players' identities, ranks and loadouts during a match are N/A.",
+            None => Span::styled("not in a match", Style::new().fg(MUTED)),
+        },
+        Span::styled(
+            if st.loading { "   refreshing…".to_string() } else { next.map(|n| format!("   refresh in {n}s")).unwrap_or_default() },
             Style::new().fg(MUTED),
-        )),
-    ];
+        ),
+    ])];
     if let Some(e) = &st.error {
         lines.push(Line::from(Span::styled(e.clone(), Style::new().fg(Color::Yellow))));
-    } else if !consent {
-        lines.push(Line::from(Span::styled("Link this account with Riot Sign On to show your own rank/stats (Manage Riot Accounts → l).", Style::new().fg(Color::Yellow))));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Shows what the game shows you. Other players' ranks are never looked up; hidden names and levels stay hidden.",
+            Style::new().fg(MUTED),
+        )));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(block("Live Match")), head);
-
-    let owner_stats = st.data.as_ref().map(|d| &d.stats);
-    if running || st.data.as_ref().map(|d| d.views.is_empty()).unwrap_or(true) {
-        // Live view: only the consenting owner's own data.
-        let owner_acc = st.data.as_ref().map(|d| d.account.clone()).or_else(|| app.status.active.as_ref().map(|a| a.0.clone()));
-        let me = owner_acc.map(|acc| PlayerLine {
-            puuid: acc.puuid.clone(),
-            name: acc.display(),
-            team: String::new(),
-            agent: "N/A".into(),
-            tier: None,
-            level: None,
-            kills: 0,
-            deaths: 0,
-            assists: 0,
-            score: 0,
-            hs_pct: None,
-            consented: true,
-            is_owner: true,
-            is_ally: true,
-        });
-        let ally: Vec<PlayerLine> = me.into_iter().collect();
-        let [a, b, c] = Layout::vertical([Constraint::Length(8), Constraint::Length(8), Constraint::Min(0)]).areas(main);
-        f.render_widget(team_table(&ally, "Your team (live)".into(), owner_stats, main.width, true), a);
-        f.render_widget(team_table(&[], "Opponents (live)".into(), None, main.width, true), b);
-        if let Some(v) = st.data.as_ref().and_then(|d| d.views.first())
-            && c.height >= 4
-        {
-            f.render_widget(
-                Paragraph::new(vec![
-                    Line::from(Span::styled("Last completed match", Style::new().fg(MUTED))),
-                    Line::from(format!("{} · {} · {} {} · {}", v.map, v.mode, v.result_label(), v.score_line(), matches::fmt_time(v.started_ms))),
-                ]),
-                c,
-            );
+    let stats = st.data.as_ref().map(|d| &d.stats);
+    match (view, st.data.as_ref().and_then(|d| d.last_match.as_ref())) {
+        (Some(v), _) => {
+            let [a, b] = Layout::vertical([Constraint::Length(8), Constraint::Length(8)]).areas(main);
+            let ally: Vec<PlayerLine> = v.players.iter().filter(|p| p.is_ally).cloned().collect();
+            let enemy: Vec<PlayerLine> = v.players.iter().filter(|p| !p.is_ally).cloned().collect();
+            f.render_widget(team_table(&ally, "Your team".into(), stats, main.width, true), a);
+            if v.phase == matches::LivePhase::InGame {
+                f.render_widget(team_table(&enemy, "Opponents".into(), stats, main.width, true), b);
+            } else {
+                f.render_widget(Paragraph::new("Opponents appear once the match loads.").block(block("Opponents")), b);
+            }
         }
-    } else if let Some(v) = st.data.as_ref().and_then(|d| d.views.first()) {
-        draw_match(f, v, owner_stats, main, "Post-match");
+        (None, Some(last)) => draw_match(f, last, stats, main, "Last match"),
+        (None, None) => {
+            let me: Vec<PlayerLine> = app
+                .status
+                .active
+                .as_ref()
+                .map(|a| PlayerLine {
+                    puuid: a.0.puuid.clone(),
+                    name: a.0.display(),
+                    team: String::new(),
+                    agent: "—".into(),
+                    tier: None,
+                    level: None,
+                    kills: 0,
+                    deaths: 0,
+                    assists: 0,
+                    score: 0,
+                    hs_pct: None,
+                    is_owner: true,
+                    is_ally: true,
+                    vandal: None,
+                    phantom: None,
+                    variant: None,
+                })
+                .into_iter()
+                .collect();
+            let [a, _] = Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(main);
+            f.render_widget(team_table(&me, "You".into(), stats, main.width, true), a);
+        }
     }
 }
 
 fn draw_history(f: &mut Frame, app: &App, st: &HistoryState, area: Rect) {
-    let title = format!("Match History — {}{}", app.active_label(), if st.loading { "  (refreshing…)" } else { "" });
+    let title = format!("Match History — {}{}", st.data.as_ref().map(|d| d.account.clone()).unwrap_or_else(|| app.active_label()), if st.loading { "  (loading new matches…)" } else { "" });
     let Some(d) = &st.data else {
         let msg = st.error.clone().unwrap_or_else(|| "Loading…".into());
         f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: true }).block(block(title)), area);

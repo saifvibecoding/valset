@@ -1,19 +1,14 @@
-//! Match dashboards built from VAL-MATCH-V1 data.
+//! Match history and live match dashboards.
 //!
-//! Privacy and competitive-integrity rules implemented here:
-//!
-//! * Only *completed* matches from the official API are shown; there is no live
-//!   roster for VALORANT through supported interfaces, so live rows are `N/A`.
-//! * Profile-level data (rank history, peak, win rate, level) is computed only
-//!   for accounts that opted in through RSO (`consent`).
-//! * Other players are shown exactly as the post-match data lists them (the
-//!   same information as the end-of-game scoreboard) and are never looked up
-//!   further. Names can be hidden entirely with `hide_other_names`.
-//! * Equipped skins / variants and RR are not exposed by any public API → `N/A`.
+//! Fair-play rules: only information the game itself shows you is displayed.
+//! Your own rank, RR and peak are shown; other players' ranks are never looked
+//! up. Players who hid their name (incognito / streamer mode) stay hidden, and
+//! hidden account levels stay hidden.
 
 use crate::rank;
-use crate::riot::models::{Content, Match};
-use std::collections::HashSet;
+use crate::riot::content::Content;
+use crate::riot::models::{self, CoreGameMatch, Loadouts, Match, PregameMatch};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default)]
 pub struct OwnerStats {
@@ -24,6 +19,7 @@ pub struct OwnerStats {
     pub headshots: i64,
     pub shots: i64,
     pub current_tier: Option<i32>,
+    pub rr: Option<i32>,
     pub peak_tier: Option<i32>,
     pub level: Option<i32>,
 }
@@ -37,6 +33,15 @@ impl OwnerStats {
     }
     pub fn win_rate(&self) -> Option<f64> {
         if self.games == 0 { None } else { Some(self.wins as f64 * 100.0 / self.games as f64) }
+    }
+    pub fn apply_mmr(&mut self, mmr: &models::Mmr) {
+        if let Some((t, rr)) = mmr.current() {
+            self.current_tier = Some(t);
+            self.rr = Some(rr);
+        }
+        if let Some(p) = mmr.peak_tier() {
+            self.peak_tier = Some(self.peak_tier.map_or(p, |x| x.max(p)));
+        }
     }
 }
 
@@ -53,9 +58,11 @@ pub struct PlayerLine {
     pub assists: i32,
     pub score: i32,
     pub hs_pct: Option<f64>,
-    pub consented: bool,
     pub is_owner: bool,
     pub is_ally: bool,
+    pub vandal: Option<String>,
+    pub phantom: Option<String>,
+    pub variant: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +101,7 @@ pub fn headshot_counts(m: &Match, puuid: &str) -> (i64, i64) {
     let mut hs = 0i64;
     let mut total = 0i64;
     for r in m.round_results.iter().flatten() {
-        for ps in r.player_stats.iter().filter(|p| p.puuid == puuid) {
+        for ps in r.player_stats.iter().filter(|p| p.subject == puuid) {
             for d in &ps.damage {
                 hs += d.headshots as i64;
                 total += (d.headshots + d.bodyshots + d.legshots) as i64;
@@ -104,50 +111,56 @@ pub fn headshot_counts(m: &Match, puuid: &str) -> (i64, i64) {
     (hs, total)
 }
 
-fn map_label(m: &Match, content: Option<&Content>) -> String {
-    if let Some(n) = content.and_then(|c| c.map_name(&m.match_info.map_id)) {
+pub fn map_label(map_id: &str, content: Option<&Content>) -> String {
+    if let Some(n) = content.and_then(|c| c.map_name(map_id)) {
         return n;
     }
-    let code = m.match_info.map_id.rsplit('/').next().unwrap_or(&m.match_info.map_id);
-    crate::game::map_display_name(code)
+    let code = map_id.rsplit('/').next().unwrap_or(map_id);
+    if code.is_empty() { "Unknown map".into() } else { crate::game::map_display_name(code) }
 }
 
-pub fn build_view(m: &Match, content: Option<&Content>, owner_api_puuid: &str, consented: &HashSet<String>, hide_other_names: bool) -> MatchView {
-    let owner_team = m.players.iter().find(|p| p.puuid == owner_api_puuid).map(|p| p.team_id.clone());
+fn agent_label(id: &str, content: Option<&Content>) -> String {
+    if id.is_empty() {
+        return "—".into();
+    }
+    content.and_then(|c| c.agent_name(id)).unwrap_or_else(|| "Agent".into())
+}
+
+fn display_name(game_name: &str, tag: &str, agent: &str, is_owner: bool, hide: bool) -> String {
+    if !is_owner && hide {
+        return agent.to_string();
+    }
+    if game_name.is_empty() { format!("Hidden ({agent})") } else { format!("{game_name}#{tag}") }
+}
+
+pub fn build_view(m: &Match, content: Option<&Content>, owner: &str, hide_other_names: bool) -> MatchView {
+    let owner_team = m.player(owner).map(|p| p.team_id.clone());
     let mut players: Vec<PlayerLine> = m
         .players
         .iter()
         .filter(|p| !p.is_observer)
         .map(|p| {
-            let is_owner = p.puuid == owner_api_puuid;
-            let consented_p = is_owner || consented.contains(&p.puuid);
+            let is_owner = p.subject == owner;
             let st = p.stats.clone().unwrap_or_default();
-            let (hs, total) = headshot_counts(m, &p.puuid);
-            let name = if consented_p || !hide_other_names {
-                if p.game_name.is_empty() { "Hidden player".to_string() } else { format!("{}#{}", p.game_name, p.tag_line) }
-            } else {
-                "Player".to_string()
-            };
-            let agent = p
-                .character_id
-                .as_deref()
-                .map(|id| content.and_then(|c| c.agent_name(id)).unwrap_or_else(|| "Unknown agent".into()))
-                .unwrap_or_else(|| "N/A".into());
+            let (hs, total) = headshot_counts(m, &p.subject);
+            let agent = agent_label(p.character_id.as_deref().unwrap_or(""), content);
             PlayerLine {
-                puuid: p.puuid.clone(),
-                name,
+                puuid: p.subject.clone(),
+                name: display_name(&p.game_name, &p.tag_line, &agent, is_owner, hide_other_names),
                 team: p.team_id.clone(),
                 agent,
-                tier: if consented_p && p.competitive_tier > 0 { Some(p.competitive_tier) } else { None },
-                level: if consented_p && p.account_level > 0 { Some(p.account_level) } else { None },
+                tier: if is_owner && p.competitive_tier > 0 { Some(p.competitive_tier) } else { None },
+                level: if is_owner && p.account_level > 0 { Some(p.account_level) } else { None },
                 kills: st.kills,
                 deaths: st.deaths,
                 assists: st.assists,
                 score: st.score,
                 hs_pct: if total > 0 { Some(hs as f64 * 100.0 / total as f64) } else { None },
-                consented: consented_p,
                 is_owner,
                 is_ally: owner_team.as_deref() == Some(p.team_id.as_str()),
+                vandal: None,
+                phantom: None,
+                variant: None,
             }
         })
         .collect();
@@ -157,7 +170,7 @@ pub fn build_view(m: &Match, content: Option<&Content>, owner_api_puuid: &str, c
     let owner_line = players.iter().find(|p| p.is_owner).cloned();
     MatchView {
         match_id: m.match_info.match_id.clone(),
-        map: map_label(m, content),
+        map: map_label(&m.match_info.map_id, content),
         mode: crate::riot::queue_name(&m.match_info.queue_id, &m.match_info.game_mode),
         ranked: m.match_info.is_ranked,
         started_ms: m.match_info.game_start_millis,
@@ -169,11 +182,11 @@ pub fn build_view(m: &Match, content: Option<&Content>, owner_api_puuid: &str, c
     }
 }
 
-/// Aggregate stats for a consenting player over stored matches (newest first).
-pub fn owner_stats(matches: &[Match], owner_api_puuid: &str) -> OwnerStats {
+/// Aggregate stats over stored matches (newest first).
+pub fn owner_stats(matches: &[Match], owner: &str) -> OwnerStats {
     let mut s = OwnerStats::default();
     for m in matches {
-        let Some(p) = m.players.iter().find(|p| p.puuid == owner_api_puuid) else { continue };
+        let Some(p) = m.player(owner) else { continue };
         s.games += 1;
         if m.teams.iter().flatten().any(|t| t.team_id == p.team_id && t.won) {
             s.wins += 1;
@@ -182,22 +195,129 @@ pub fn owner_stats(matches: &[Match], owner_api_puuid: &str) -> OwnerStats {
             s.kills += st.kills as i64;
             s.deaths += st.deaths as i64;
         }
-        let (hs, total) = headshot_counts(m, owner_api_puuid);
+        let (hs, total) = headshot_counts(m, owner);
         s.headshots += hs;
         s.shots += total;
         if s.level.is_none() && p.account_level > 0 {
             s.level = Some(p.account_level);
         }
-        if m.match_info.is_ranked || m.match_info.queue_id == "competitive" {
-            if s.current_tier.is_none() && p.competitive_tier > 0 {
+        if (m.match_info.is_ranked || m.match_info.queue_id == "competitive") && p.competitive_tier > 0 {
+            if s.current_tier.is_none() {
                 s.current_tier = Some(p.competitive_tier);
             }
-            if p.competitive_tier > 0 {
-                s.peak_tier = Some(s.peak_tier.map_or(p.competitive_tier, |x| x.max(p.competitive_tier)));
-            }
+            s.peak_tier = Some(s.peak_tier.map_or(p.competitive_tier, |x| x.max(p.competitive_tier)));
         }
     }
     s
+}
+
+// ------------------------------------------------------------------ live
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePhase {
+    AgentSelect,
+    InGame,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveView {
+    pub phase: LivePhase,
+    pub match_id: String,
+    pub map: String,
+    pub mode: String,
+    pub players: Vec<PlayerLine>,
+}
+
+fn skins_for(loadouts: Option<&Loadouts>, puuid: &str, content: Option<&Content>) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(l) = loadouts.and_then(|l| l.loadouts.iter().find(|x| x.loadout.subject == puuid)) else { return (None, None, None) };
+    let skin = |weapon: &str| -> (Option<String>, Option<String>) {
+        let Some(item) = l.loadout.items.get(weapon) else { return (None, None) };
+        let skin_id = item.sockets.get(models::SOCKET_SKIN).map(|s| s.item.id.clone()).unwrap_or_default();
+        let chroma_id = item.sockets.get(models::SOCKET_CHROMA).map(|s| s.item.id.clone()).unwrap_or_default();
+        let name = content.and_then(|c| c.skin_name(&skin_id));
+        let chroma = content.and_then(|c| c.chroma_name(&chroma_id)).filter(|ch| Some(ch) != name.as_ref());
+        (name, chroma)
+    };
+    let (vandal, variant) = skin(models::WEAPON_VANDAL);
+    let (phantom, _) = skin(models::WEAPON_PHANTOM);
+    (vandal, phantom, variant)
+}
+
+pub fn build_live(m: &CoreGameMatch, loadouts: Option<&Loadouts>, names: &HashMap<String, (String, String)>, content: Option<&Content>, owner: &str, hide_other_names: bool) -> LiveView {
+    let owner_team = m.players.iter().find(|p| p.subject == owner).map(|p| p.team_id.clone());
+    let mut players: Vec<PlayerLine> = m
+        .players
+        .iter()
+        .filter(|p| !p.is_coach)
+        .map(|p| {
+            let is_owner = p.subject == owner;
+            let agent = agent_label(&p.character_id, content);
+            let hidden = p.player_identity.incognito && !is_owner;
+            let (gn, tag) = if hidden { (String::new(), String::new()) } else { names.get(&p.subject).cloned().unwrap_or_default() };
+            let (vandal, phantom, variant) = skins_for(loadouts, &p.subject, content);
+            PlayerLine {
+                puuid: p.subject.clone(),
+                name: if !is_owner && gn.is_empty() && !hidden { agent.clone() } else { display_name(&gn, &tag, &agent, is_owner, hide_other_names) },
+                team: p.team_id.clone(),
+                agent,
+                tier: None,
+                level: if p.player_identity.hide_account_level && !is_owner { None } else { Some(p.player_identity.account_level).filter(|l| *l > 0) },
+                kills: 0,
+                deaths: 0,
+                assists: 0,
+                score: 0,
+                hs_pct: None,
+                is_owner,
+                is_ally: owner_team.as_deref() == Some(p.team_id.as_str()),
+                vandal,
+                phantom,
+                variant,
+            }
+        })
+        .collect();
+    players.sort_by_key(|p| !p.is_owner);
+    let queue = m.matchmaking_data.as_ref().map(|d| d.queue_id.clone()).unwrap_or_default();
+    LiveView {
+        phase: LivePhase::InGame,
+        match_id: m.match_id.clone(),
+        map: map_label(&m.map_id, content),
+        mode: crate::riot::queue_name(&queue, &m.mode_id),
+        players,
+    }
+}
+
+pub fn build_pregame(m: &PregameMatch, names: &HashMap<String, (String, String)>, content: Option<&Content>, owner: &str, hide_other_names: bool) -> LiveView {
+    let team = m.ally_team.clone().unwrap_or_default();
+    let mut players: Vec<PlayerLine> = team
+        .players
+        .iter()
+        .map(|p| {
+            let is_owner = p.subject == owner;
+            let agent = if p.character_id.is_empty() { "Selecting…".to_string() } else { agent_label(&p.character_id, content) };
+            let hidden = p.player_identity.incognito && !is_owner;
+            let (gn, tag) = if hidden { (String::new(), String::new()) } else { names.get(&p.subject).cloned().unwrap_or_default() };
+            PlayerLine {
+                puuid: p.subject.clone(),
+                name: display_name(&gn, &tag, &agent, is_owner, hide_other_names),
+                team: team.team_id.clone(),
+                agent,
+                tier: None,
+                level: if p.player_identity.hide_account_level && !is_owner { None } else { Some(p.player_identity.account_level).filter(|l| *l > 0) },
+                kills: 0,
+                deaths: 0,
+                assists: 0,
+                score: 0,
+                hs_pct: None,
+                is_owner,
+                is_ally: true,
+                vandal: None,
+                phantom: None,
+                variant: None,
+            }
+        })
+        .collect();
+    players.sort_by_key(|p| !p.is_owner);
+    LiveView { phase: LivePhase::AgentSelect, match_id: m.id.clone(), map: map_label(&m.map_id, content), mode: crate::riot::queue_name(&m.queue_id, &m.mode), players }
 }
 
 pub fn fmt_opt_pct(v: Option<f64>) -> String {

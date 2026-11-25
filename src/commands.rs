@@ -7,7 +7,6 @@ use crate::engine::{Change, Engine, LoadOptions, Target, parse_categories};
 use crate::matches;
 use crate::profile::{self, ManualValue, Profile};
 use crate::rank;
-use crate::riot::RiotApi;
 use crate::service;
 use crate::term::{self, bold, dim, paint};
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,10 +19,6 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    fn api(&self) -> RiotApi {
-        RiotApi::new(self.engine.config.api_key())
-    }
-
     fn target(&self, account: Option<&str>) -> Result<(Target, bool)> {
         match account {
             Some(a) => Ok((self.engine.resolve_target(a)?, true)),
@@ -41,12 +36,16 @@ impl Ctx {
     /// Confirm the target when detection was only a guess.
     fn confirm_target(&self, t: &Target, confident: bool) -> Result<()> {
         if !confident {
-            term::warn(&format!("The active account could not be detected reliably; best guess is {} ({}).", self.label(&t.puuid), t.folder));
+            term::warn(&format!("The Riot Client is not open, so VALSYNC is guessing the account: {}.", self.label(&t.puuid)));
             if !term::confirm("Use this account?", false)? {
-                bail!("cancelled. Select the account with `valsync accounts select <account>` or pass --account.");
+                bail!("cancelled. Open the Riot Client and sign in to the account you want.");
             }
         }
         Ok(())
+    }
+
+    fn session(&self) -> Result<crate::riot::Session> {
+        service::runtime().block_on(service::connect(&self.engine.paths.valorant_logs, &self.engine.db, &self.engine.config))
     }
 }
 
@@ -55,9 +54,7 @@ pub fn run(cmd: Command, ctx: &mut Ctx) -> Result<()> {
     match cmd {
         Command::Status => status(ctx),
         Command::Accounts { action } => accounts(ctx, action.unwrap_or(AccountAction::List)),
-        Command::Save { name, overwrite, categories, note, crosshair_code, sens, account } => {
-            save(ctx, &name, overwrite, &categories, note, crosshair_code, sens, account.as_deref())
-        }
+        Command::Save { name, overwrite, categories, note, account } => save(ctx, &name, overwrite, &categories, note, account.as_deref()),
         Command::Load { name, categories, dry_run, account } => load(ctx, &name, &categories, dry_run, account.as_deref()),
         Command::Restore { backup, original, account, dry_run } => restore(ctx, backup, original, account.as_deref(), dry_run),
         Command::Undo { account } => undo_redo(ctx, true, account.as_deref()),
@@ -74,7 +71,7 @@ pub fn run(cmd: Command, ctx: &mut Ctx) -> Result<()> {
                 Err(anyhow!("__tui_live__"))
             }
         }
-        Command::History { count, account, offline } => history(ctx, count, account.as_deref(), offline),
+        Command::History { count, offline } => history(ctx, count, offline),
         Command::Doctor => doctor(ctx),
         Command::Config { action } => config(ctx, action.unwrap_or(ConfigAction::Show)),
         Command::Bench => crate::bench::run(ctx),
@@ -84,13 +81,20 @@ pub fn run(cmd: Command, ctx: &mut Ctx) -> Result<()> {
 fn report_recovery(e: &Engine) {
     let r = &e.startup_recovery;
     for id in &r.recovered_ops {
-        term::warn(&format!("Recovered from an interrupted operation (#{id}): the account's previous settings were restored."));
+        term::warn(&format!("VALSYNC was interrupted last time (operation #{id}); your previous settings were put back."));
     }
     for (id, err) in &r.failed_ops {
-        term::error(&format!("Interrupted operation #{id} could not be rolled back yet: {err}"));
+        term::error(&format!("Interrupted operation #{id} could not be undone yet: {err}"));
     }
     if r.deferred {
-        term::warn("An interrupted operation needs recovery, but VALORANT is running. Close the game and run any VALSYNC command.");
+        term::warn("An interrupted change still needs to be undone: close VALORANT and keep the Riot Client signed in to that account, then run VALSYNC again.");
+    }
+}
+
+fn riot_line(ctx: &Ctx) -> String {
+    match ctx.engine.cloud_account() {
+        Some(p) => format!("{} signed in as {}", term::dot(true), bold(&ctx.label(&p))),
+        None => format!("{} {}", term::dot(false), ctx.engine.cloud_error.clone().unwrap_or_else(|| "not connected".into())),
     }
 }
 
@@ -99,31 +103,22 @@ fn status(ctx: &mut Ctx) -> Result<()> {
     let s = service::status(&ctx.engine)?;
     println!("{}", paint(term::LOGO, Color::Rgb { r: 255, g: 70, b: 85 }));
     println!("{}\n", dim(&format!("  v{} · VALORANT settings manager", env!("CARGO_PKG_VERSION"))));
+    println!("  Riot Client      {}", riot_line(ctx));
     let acct = match &s.active {
-        Some((row, folder, m)) => format!(
-            "{}  {}  {}",
-            bold(&row.display()),
-            dim(&format!("[{}]", row.shard.clone().unwrap_or_else(|| "?".into()).to_uppercase())),
-            dim(&format!("{} · {}", m.label(), folder))
-        ),
-        None => paint("none detected", Color::Yellow),
+        Some((row, _, m)) => format!("{}  {}", bold(&row.display()), dim(&format!("[{}] {}", row.shard.clone().unwrap_or_else(|| "?".into()).to_uppercase(), m.label()))),
+        None => paint("none — open the Riot Client and sign in", Color::Yellow),
     };
-    println!("  Active account   {acct}");
-    println!("  Riot Client      {} {}", term::dot(s.processes.riot_client), if s.processes.riot_client { "running" } else { "not running" });
+    println!("  Account          {acct}");
     println!(
         "  VALORANT         {} {}",
         if s.processes.valorant { paint("●", Color::Yellow) } else { term::dot(false) },
-        if s.processes.valorant { "running (close it before loading/restoring settings)" } else { "closed" }
+        if s.processes.valorant { "running (close it before loading or restoring settings)" } else { "closed" }
     );
     println!("  Game patch       {}", s.patch.clone().unwrap_or_else(|| "unknown".into()));
     println!("  Last saved       {}", s.last_saved_profile.clone().unwrap_or_else(|| "—".into()));
     println!("  Profiles         {}", s.profile_count);
     println!("  Backups          {} for this account · {} total", s.backup_count_active, s.backup_count_total);
     println!("  Undo / Redo      {} / {}", if s.undo_available { "available" } else { "—" }, if s.redo_available { "available" } else { "—" });
-    println!("  Riot API key     {}", if s.api_key { "configured" } else { "not configured (Riot ID lookups and match data unavailable)" });
-    if !s.config_dir_exists {
-        term::warn(&format!("VALORANT config folder not found at {}", ctx.engine.paths.valorant_config.display()));
-    }
     if let Some(sw) = &s.switch {
         term::info(&format!("Account switch detected: {} → {}", sw.from.as_deref().map(|p| ctx.label(p)).unwrap_or_else(|| "—".into()), ctx.label(&sw.to)));
     }
@@ -131,12 +126,7 @@ fn status(ctx: &mut Ctx) -> Result<()> {
 }
 
 // --------------------------------------------------------------------- accounts
-fn account_puuid(ctx: &Ctx, account: Option<&str>) -> Result<String> {
-    Ok(ctx.target(account)?.0.puuid)
-}
-
 fn accounts(ctx: &mut Ctx, action: AccountAction) -> Result<()> {
-    let rt = service::runtime();
     match action {
         AccountAction::List => {
             let det = ctx.engine.detection();
@@ -148,89 +138,36 @@ fn accounts(ctx: &mut Ctx, action: AccountAction) -> Result<()> {
                 .accounts()?
                 .into_iter()
                 .map(|a| {
-                    let local = det.accounts.iter().any(|l| l.puuid == a.puuid);
                     vec![
                         if active.as_deref() == Some(a.puuid.as_str()) { paint("▶", Color::Green) } else { " ".into() },
-                        a.riot_id().unwrap_or_else(|| dim("(Riot ID unknown)")),
+                        a.riot_id().unwrap_or_else(|| dim("(name appears after signing in once)")),
                         a.shard.clone().unwrap_or_else(|| "?".into()).to_uppercase(),
-                        db::short_id(&a.puuid),
-                        if local { "yes".into() } else { dim("no") },
-                        match (a.source.as_str(), a.verified) {
-                            ("rso", _) => paint("RSO verified", Color::Green),
-                            (_, true) => paint("API verified", Color::Green),
-                            ("manual", false) => paint("manual (unverified)", Color::Yellow),
-                            _ => dim("local folder"),
-                        },
-                        if a.consent { paint("yes", Color::Green) } else { dim("no") },
+                        ctx.engine.db.backup_count(Some(&a.puuid)).unwrap_or(0).to_string(),
                         a.preferred_profile.clone().unwrap_or_else(|| "—".into()),
                     ]
                 })
                 .collect();
             if rows.is_empty() {
-                term::warn("No accounts found. Launch VALORANT once with each account so it creates its config folder.");
+                term::warn("No accounts yet. Open the Riot Client and sign in — VALSYNC picks it up automatically.");
                 return Ok(());
             }
-            term::table(&["", "Riot ID", "Shard", "PUUID", "On this PC", "Identity", "RSO consent", "Preferred profile"], &rows);
-            if let Some((_, m)) = &det.active {
-                println!("\n{}", dim(&format!("Active account: {}", m.label())));
-            }
-        }
-        AccountAction::Name { riot_id, account } => {
-            let puuid = account_puuid(ctx, account.as_deref())?;
-            let api = ctx.api();
-            let cfg = ctx.engine.config.clone();
-            match rt.block_on(service::set_riot_id(&api, &mut ctx.engine.db, &cfg, &puuid, &riot_id)) {
-                Ok(service::IdentityResult::Verified) => term::ok(&format!("{riot_id} verified via ACCOUNT-V1 and linked to {}", db::short_id(&puuid))),
-                Ok(service::IdentityResult::ExistsUnverified) => {
-                    term::ok(&format!("{riot_id} exists (ACCOUNT-V1). Saved for {}.", db::short_id(&puuid)));
-                    term::info("Ownership of this config folder can only be proven with Riot Sign On (`valsync accounts link`).");
-                }
-                Ok(service::IdentityResult::StoredManual) => term::ok(&format!("Saved {riot_id} for {} (unverified: no API key).", db::short_id(&puuid))),
-                Err(e) => term::warn(&format!("{e:#}")),
-            }
-        }
-        AccountAction::Select { account } => {
-            let t = ctx.engine.resolve_target(&account)?;
-            ctx.engine.config.manual_active_account = Some(t.puuid.clone());
-            ctx.engine.save_config()?;
-            term::ok(&format!("Manual fallback account set to {} ({}).", ctx.label(&t.puuid), t.folder));
-            term::info("VALORANT's own last-user record still takes priority when present.");
-        }
-        AccountAction::Auto => {
-            ctx.engine.config.manual_active_account = None;
-            ctx.engine.save_config()?;
-            term::ok("Using automatic account detection.");
-        }
-        AccountAction::Link { account, no_browser } => {
-            let puuid = account_puuid(ctx, account.as_deref())?;
-            let api = ctx.api();
-            let cfg = ctx.engine.config.clone();
-            term::info("Opening Riot Sign On. Sign in on Riot's page; VALSYNC never sees your password.");
-            let id = rt.block_on(service::rso_link(&api, &mut ctx.engine.db, &cfg, &puuid, !no_browser, |u| {
-                println!("  {}", dim(&format!("Login URL: {u}")));
-            }))?;
-            term::ok(&format!("Linked {id} with RSO consent. Match history is now available for this account."));
-        }
-        AccountAction::Unlink { account } => {
-            let puuid = account_puuid(ctx, account.as_deref())?;
-            ctx.engine.db.set_account_consent(&puuid, false)?;
-            ctx.engine.db.conn.execute("DELETE FROM matches WHERE owner_puuid=?1", [&puuid])?;
-            term::ok("Consent withdrawn and stored match data deleted.");
+            term::table(&["", "Riot ID", "Region", "Backups", "Preferred profile"], &rows);
+            println!("\n{}", dim("Switch accounts in the Riot Client as usual; VALSYNC follows automatically."));
         }
         AccountAction::Prefer { profile, account } => {
-            let puuid = account_puuid(ctx, account.as_deref())?;
+            let (t, _) = ctx.target(account.as_deref())?;
             let p = ctx.engine.db.profile(&profile)?.with_context(|| format!("profile '{profile}' not found"))?;
-            ctx.engine.db.touch_account(&puuid, None)?;
-            ctx.engine.db.set_preferred_profile(&puuid, Some(&p.name))?;
-            term::ok(&format!("Preferred profile for {} is now '{}'.", ctx.label(&puuid), p.name));
+            ctx.engine.db.touch_account(&t.puuid, None)?;
+            ctx.engine.db.set_preferred_profile(&t.puuid, Some(&p.name))?;
+            term::ok(&format!("Preferred profile for {} is now '{}'.", ctx.label(&t.puuid), p.name));
         }
         AccountAction::Forget { account } => {
             let puuid = ctx.engine.resolve_target(&account).map(|t| t.puuid).or_else(|_| {
-                ctx.engine.db.accounts()?.into_iter().find(|a| a.puuid.starts_with(&account.to_ascii_lowercase())).map(|a| a.puuid).context("account not found")
+                ctx.engine.db.accounts()?.into_iter().find(|a| a.puuid.starts_with(&account.to_ascii_lowercase()) || a.riot_id().map(|r| r.eq_ignore_ascii_case(&account)).unwrap_or(false)).map(|a| a.puuid).context("account not found")
             })?;
-            if term::confirm(&format!("Forget {}? (Game files and backups are kept.)", ctx.label(&puuid)), ctx.yes)? {
+            if term::confirm(&format!("Forget {}? (Settings and backups are kept.)", ctx.label(&puuid)), ctx.yes)? {
                 ctx.engine.db.forget_account(&puuid)?;
-                term::ok("Account forgotten. It will reappear if its config folder is still on this PC.");
+                term::ok("Account forgotten.");
             }
         }
         AccountAction::Switches => {
@@ -252,8 +189,7 @@ fn accounts(ctx: &mut Ctx, action: AccountAction) -> Result<()> {
 }
 
 // --------------------------------------------------------------------- save / load
-#[allow(clippy::too_many_arguments)]
-fn save(ctx: &mut Ctx, name: &str, overwrite: bool, categories: &str, note: Option<String>, crosshair: Option<String>, sens: Option<String>, account: Option<&str>) -> Result<()> {
+fn save(ctx: &mut Ctx, name: &str, overwrite: bool, categories: &str, note: Option<String>, account: Option<&str>) -> Result<()> {
     let cats = parse_categories(categories)?;
     let (t, confident) = ctx.target(account)?;
     ctx.confirm_target(&t, confident)?;
@@ -265,45 +201,31 @@ fn save(ctx: &mut Ctx, name: &str, overwrite: bool, categories: &str, note: Opti
             bail!("cancelled; profile '{name}' was not changed");
         }
     }
-    let mut manual = Vec::new();
-    if let Some(c) = crosshair {
-        manual.push(ManualValue { label: "Crosshair code".into(), value: c });
+    let out = ctx.engine.save_profile(&t, name, overwrite, cats.as_ref(), note, Vec::new())?;
+    term::ok(&format!("Saved '{}' from {}", out.profile.name, ctx.label(&t.puuid)));
+    print_profile_summary(&out.profile);
+    if !out.cloud {
+        term::warn("Only video settings were saved: the Riot Client isn't signed in to this account. Sign in and save again to include sensitivity, crosshair and keybinds.");
     }
-    if let Some(s) = sens {
-        manual.push(ManualValue { label: "Sensitivity".into(), value: s });
-    }
-    let out = ctx.engine.save_profile(&t, name, overwrite, cats.as_ref(), note, manual)?;
-    term::ok(&format!("Saved profile '{}' from {}", out.profile.name, ctx.label(&t.puuid)));
-    println!(
-        "  {} local settings (transferable) · {} cloud-synced (manual checklist) · {} excluded",
-        out.report.local, out.report.cloud, out.report.excluded
-    );
-    for (reason, n) in &out.report.excluded_reasons {
-        println!("  {}", dim(&format!("excluded {n}: {reason}")));
-    }
-    print_category_summary(&out.profile);
     Ok(())
 }
 
-fn print_category_summary(p: &Profile) {
+pub fn print_profile_summary(p: &Profile) {
+    if let Some(c) = &p.cloud {
+        for (k, v) in crate::cloud::highlights(c) {
+            println!("  {:<20} {}", k, bold(&v));
+        }
+    }
     let cats = p.categories();
-    let rows: Vec<Vec<String>> = Category::ALL
+    let parts: Vec<String> = Category::ALL
         .iter()
-        .map(|c| {
-            let (l, cl) = cats.get(c).copied().unwrap_or((0, 0));
-            let support = if l > 0 {
-                paint("transfer", Color::Green)
-            } else if cl > 0 {
-                paint("manual (cloud)", Color::Yellow)
-            } else if c.typical_scope() == Scope::Cloud {
-                dim("cloud-synced — not stored locally")
-            } else {
-                dim("not present in files")
-            };
-            vec![c.label().to_string(), l.to_string(), cl.to_string(), support]
-        })
+        .filter_map(|c| cats.get(c).map(|(l, cl)| (c, l + cl)))
+        .filter(|(_, n)| *n > 0)
+        .map(|(c, n)| format!("{} ({n})", c.label()))
         .collect();
-    term::table(&["Category", "Local", "Cloud", "Support"], &rows);
+    if !parts.is_empty() {
+        println!("  {}", dim(&format!("Includes: {}", parts.join(", "))));
+    }
 }
 
 fn print_changes(changes: &[Change], limit: usize) {
@@ -361,31 +283,31 @@ fn load(ctx: &mut Ctx, name: &str, categories: &str, dry_run: bool, account: Opt
         ctx.engine.ensure_game_closed()?;
     }
     ctx.confirm_target(&t, confident)?;
-    let opts = LoadOptions { categories: cats, include_cloud: ctx.engine.config.write_cloud_cache };
+    let opts = LoadOptions { categories: cats, include_cloud: false };
     let plan = ctx.engine.plan_load(&row.profile, &t, &opts)?;
     term::heading(&format!("Load '{}' → {}", row.name, ctx.label(&t.puuid)));
-    if let Some(w) = &plan.patch_warning {
+    for w in plan.warnings.iter().chain(plan.patch_warning.iter()) {
         term::warn(w);
     }
     if plan.changes.is_empty() {
-        term::ok(&format!("Nothing to change: {} setting(s) already match.", plan.unchanged));
+        term::ok("Nothing to change — this account already has these settings.");
         print_manual(&plan.manual, &row.profile.manual);
         return Ok(());
     }
     print_changes(&plan.changes, 40);
-    println!("\n  {} change(s) in {} file(s); {} already matching; {} key(s) new to this account", plan.changes.len(), plan.ops.len(), plan.unchanged, plan.new_keys);
+    println!("\n  {} setting(s) will change.", plan.changes.len());
     if dry_run {
         print_manual(&plan.manual, &row.profile.manual);
         term::info("Dry run: nothing was changed.");
         return Ok(());
     }
-    if !term::confirm(&format!("Apply {} change(s) to {}? A backup is created first.", plan.changes.len(), ctx.label(&t.puuid)), ctx.yes)? {
+    if !term::confirm(&format!("Apply to {}? Your current settings are backed up first.", ctx.label(&t.puuid)), ctx.yes)? {
         bail!("cancelled; nothing was changed");
     }
     let out = ctx.engine.apply_load(&row.profile, &t, &opts)?;
     if let Some(txn) = &out.txn {
-        term::ok(&format!("Applied and verified {} change(s) ({} file(s) written).", out.plan.changes.len(), txn.files_written));
-        println!("  Previous settings saved as backup #{} · undo with {}", txn.pre_backup, bold("valsync undo"));
+        term::ok(&format!("Done! {} setting(s) applied and verified.", out.plan.changes.len()));
+        println!("  Changed your mind? Run {} (backup #{}).", bold("valsync undo"), txn.pre_backup);
     }
     print_manual(&out.plan.manual, &row.profile.manual);
     Ok(())
@@ -676,13 +598,18 @@ fn compare(ctx: &mut Ctx, a: &str, b: &str) -> Result<()> {
     let pb = ctx.engine.db.profile(b)?.with_context(|| format!("profile '{b}' not found"))?;
     let d = profile::compare(&pa.profile, &pb.profile);
     term::heading(&format!("'{}' vs '{}'", pa.name, pb.name));
-    println!("  {} identical · {} different · {} only in '{}' · {} only in '{}'", d.same, d.changed.len(), d.only_a.len(), pa.name, d.only_b.len(), pb.name);
-    if !d.changed.is_empty() {
-        let rows: Vec<Vec<String>> = d
-            .changed
+    println!("  {} identical · {} different", d.same, d.changed.len() + d.cloud.len());
+    let mut rows: Vec<Vec<String>> = d
+        .cloud
+        .iter()
+        .map(|c| vec![c.category.label().into(), c.key.clone(), paint(&c.old_display(), Color::Cyan), paint(&c.new_display(), Color::Magenta)])
+        .collect();
+    rows.extend(
+        d.changed
             .iter()
-            .map(|(x, y)| vec![x.category.label().into(), x.key.clone(), paint(&x.display_value(), Color::Cyan), paint(&y.display_value(), Color::Magenta)])
-            .collect();
+            .map(|(x, y)| vec![x.category.label().into(), x.key.clone(), paint(&x.display_value(), Color::Cyan), paint(&y.display_value(), Color::Magenta)]),
+    );
+    if !rows.is_empty() {
         println!();
         term::table(&["Category", "Setting", &pa.name, &pb.name], &rows);
     }
@@ -741,6 +668,27 @@ fn import(ctx: &mut Ctx, file: &std::path::Path, name: Option<String>, overwrite
 }
 
 // --------------------------------------------------------------------- live / history
+fn tier_text(t: Option<i32>) -> String {
+    match t {
+        Some(t) => paint(&rank::tier_name(t), rank::term_color(t)),
+        None => dim("N/A"),
+    }
+}
+
+pub fn print_stats(s: &matches::OwnerStats) {
+    println!(
+        "  Rank {} {} · Peak {} · Level {} · K/D {} · HS {} · Win rate {} ({} games)",
+        tier_text(s.current_tier),
+        s.rr.map(|r| format!("{r} RR")).unwrap_or_default(),
+        tier_text(s.peak_tier),
+        s.level.map(|l| l.to_string()).unwrap_or_else(|| "N/A".into()),
+        s.kd().map(|k| format!("{k:.2}")).unwrap_or_else(|| "N/A".into()),
+        matches::fmt_opt_pct(s.hs_pct()),
+        matches::fmt_opt_pct(s.win_rate()),
+        s.games
+    );
+}
+
 pub fn print_match(v: &matches::MatchView) {
     term::heading(&format!("{} · {} · {} {}", v.map, v.mode, v.result_label(), v.score_line()));
     println!("  {} · duration {}", matches::fmt_time(v.started_ms), matches::fmt_duration(v.duration_ms));
@@ -748,47 +696,32 @@ pub fn print_match(v: &matches::MatchView) {
         .players
         .iter()
         .map(|p| {
-            let tier = match p.tier {
-                Some(t) => paint(&rank::tier_name(t), rank::term_color(t)),
-                None => dim("N/A"),
-            };
             vec![
                 if p.is_ally { paint("ALLY", Color::Cyan) } else { paint("ENEMY", Color::Red) },
                 if p.is_owner { bold(&p.name) } else { p.name.clone() },
                 p.agent.clone(),
-                tier,
-                p.level.map(|l| l.to_string()).unwrap_or_else(|| dim("N/A")),
                 format!("{}/{}/{}", p.kills, p.deaths, p.assists),
                 format!("{:.2}", p.kills as f64 / p.deaths.max(1) as f64),
                 matches::fmt_opt_pct(p.hs_pct),
             ]
         })
         .collect();
-    term::table(&["Team", "Riot ID", "Agent", "Rank (match)", "Level", "K/D/A", "K/D", "HS%"], &rows);
+    term::table(&["Team", "Player", "Agent", "K/D/A", "K/D", "HS%"], &rows);
 }
 
-fn history(ctx: &mut Ctx, count: usize, account: Option<&str>, offline: bool) -> Result<()> {
-    let (t, _) = ctx.target(account)?;
-    let api = ctx.api();
-    let cfg = ctx.engine.config.clone();
-    let rt = service::runtime();
-    let h = rt.block_on(service::history(&api, &mut ctx.engine.db, &cfg, &t.puuid, count.clamp(1, 50), !offline))?;
+fn history(ctx: &mut Ctx, count: usize, offline: bool) -> Result<()> {
+    let h = if offline {
+        let (t, _) = ctx.target(None)?;
+        service::history_offline(&ctx.engine.db, &ctx.engine.config, &t.puuid, count.clamp(1, 50))?
+    } else {
+        let session = ctx.session().context("match history needs the Riot Client open and signed in")?;
+        service::runtime().block_on(service::history(&session, &ctx.engine.db, &ctx.engine.config, count.clamp(1, 20)))?
+    };
     if let Some(w) = &h.warning {
         term::warn(w);
     }
-    term::heading(&format!("Match history — {}", h.account.display()));
-    let s = &h.stats;
-    println!(
-        "  Games {} · Win rate {} · K/D {} · HS {} · Current rank {} · Peak recorded {} · Level {}",
-        s.games,
-        matches::fmt_opt_pct(s.win_rate()),
-        s.kd().map(|k| format!("{k:.2}")).unwrap_or_else(|| "N/A".into()),
-        matches::fmt_opt_pct(s.hs_pct()),
-        matches::fmt_tier(s.current_tier),
-        matches::fmt_tier(s.peak_tier),
-        s.level.map(|l| l.to_string()).unwrap_or_else(|| "N/A".into())
-    );
-    println!("{}", dim("  RR and equipped skins are not available through supported Riot APIs (N/A)."));
+    term::heading(&format!("Match history — {}", h.account));
+    print_stats(&h.stats);
     let rows: Vec<Vec<String>> = h
         .views
         .iter()
@@ -811,7 +744,7 @@ fn history(ctx: &mut Ctx, count: usize, account: Option<&str>, offline: bool) ->
         })
         .collect();
     if rows.is_empty() {
-        term::info("No matches stored yet.");
+        term::info("No matches yet.");
     } else {
         println!();
         term::table(&["Date", "Map", "Mode", "Result", "Score", "Agent", "K/D/A", "HS%"], &rows);
@@ -820,31 +753,43 @@ fn history(ctx: &mut Ctx, count: usize, account: Option<&str>, offline: bool) ->
 }
 
 fn live_once(ctx: &mut Ctx) -> Result<()> {
-    let st = ctx.engine.probe.status();
-    term::heading("Live match");
-    println!("  VALORANT {}", if st.valorant { paint("running", Color::Green) } else { dim("not running") });
-    if st.valorant
-        && let Some(m) = crate::game::current_map_from_log(&ctx.engine.paths.valorant_logs)
-    {
-        println!("  Map (your client, local log): {}", crate::game::map_display_name(&m));
+    let session = ctx.session().context("Live Match needs the Riot Client open and signed in")?;
+    let d = service::runtime().block_on(service::live(&session, &ctx.engine.db, &ctx.engine.config, None))?;
+    if let Some(w) = &d.warning {
+        term::warn(w);
     }
-    term::warn("Riot provides no supported live-match API for VALORANT. Rosters, ranks and loadouts of a match in progress are N/A.");
-    term::info("The latest completed match (VAL-MATCH-V1, RSO-linked accounts only):");
-    let (t, _) = ctx.target(None)?;
-    let api = ctx.api();
-    let cfg = ctx.engine.config.clone();
-    let rt = service::runtime();
-    match rt.block_on(service::history(&api, &mut ctx.engine.db, &cfg, &t.puuid, 1, true)) {
-        Ok(h) => {
-            if let Some(w) = &h.warning {
-                term::warn(w);
-            }
-            match h.views.first() {
-                Some(v) => print_match(v),
-                None => term::info("No completed matches stored yet."),
+    term::heading(&format!("Live match — {}", d.account));
+    print_stats(&d.stats);
+    match &d.view {
+        Some(v) => {
+            println!(
+                "\n  {} · {} · {}",
+                bold(&v.map),
+                v.mode,
+                if v.phase == matches::LivePhase::AgentSelect { "agent select" } else { "in game" }
+            );
+            let rows: Vec<Vec<String>> = v
+                .players
+                .iter()
+                .map(|p| {
+                    vec![
+                        if p.is_ally { paint("ALLY", Color::Cyan) } else { paint("ENEMY", Color::Red) },
+                        if p.is_owner { bold(&p.name) } else { p.name.clone() },
+                        p.agent.clone(),
+                        p.level.map(|l| l.to_string()).unwrap_or_else(|| dim("hidden")),
+                        p.vandal.clone().unwrap_or_else(|| dim("N/A")),
+                        p.phantom.clone().unwrap_or_else(|| dim("N/A")),
+                    ]
+                })
+                .collect();
+            term::table(&["Team", "Player", "Agent", "Level", "Vandal", "Phantom"], &rows);
+        }
+        None => {
+            term::info("You're not in agent select or a match right now.");
+            if let Some(m) = &d.last_match {
+                print_match(m);
             }
         }
-        Err(e) => term::warn(&format!("{e:#}")),
     }
     Ok(())
 }
@@ -859,72 +804,52 @@ fn check(okay: bool, label: &str, detail: &str) {
 }
 
 fn doctor(ctx: &mut Ctx) -> Result<()> {
-    let e = &ctx.engine;
     term::heading("VALSYNC doctor");
-    let cfg_dir = &e.paths.valorant_config;
-    check(cfg_dir.is_dir(), "VALORANT config folder", &cfg_dir.display().to_string());
-    let det = e.detection();
-    check(!det.accounts.is_empty(), "Account config folders", &format!("{} found", det.accounts.len()));
-    check(det.last_known_user.is_some(), "VALORANT last-user record (RiotLocalMachine.ini)", if det.last_known_user.is_some() { "present" } else { "missing — active account will be guessed or must be selected" });
-    match &det.active {
-        Some((a, m)) => check(m.is_confident(), "Active account", &format!("{} · {}", e.account_label(&a.puuid), m.label())),
-        None => check(false, "Active account", "none"),
+    let lock = crate::riot::local::Lockfile::read();
+    check(lock.is_some(), "Riot Client running", &crate::riot::local::lockfile_path().display().to_string());
+    match ctx.engine.cloud_account() {
+        Some(p) => check(true, "Signed in", &ctx.label(&p)),
+        None => check(false, "Signed in", &ctx.engine.cloud_error.clone().unwrap_or_default()),
     }
+    if let Some(c) = ctx.engine.cloud.as_ref() {
+        match c.fetch() {
+            Ok(doc) => check(true, "Account settings readable", &format!("{} settings", crate::cloud::entries(&doc).len())),
+            Err(e) => check(false, "Account settings readable", &format!("{e:#}")),
+        }
+    }
+    let e = &ctx.engine;
+    let cfg_dir = &e.paths.valorant_config;
+    check(cfg_dir.is_dir(), "VALORANT settings folder", &cfg_dir.display().to_string());
+    let det = e.detection();
     for a in &det.accounts {
         let probe = a.path.join(".valsync-write-test");
         let writable = std::fs::write(&probe, b"x").is_ok() && std::fs::remove_file(&probe).is_ok();
-        let files = Engine::read_account_files(&a.path).map(|f| f.len()).unwrap_or(0);
-        check(writable, &format!("Folder {}", a.folder), &format!("{files} ini file(s), {}", if writable { "writable" } else { "NOT writable" }));
+        check(writable, &format!("Video settings of {}", e.account_label(&a.puuid)), if writable { "writable" } else { "NOT writable" });
     }
     let st = e.probe.status();
-    check(true, "Riot Client", if st.riot_client { "running" } else { "not running" });
-    check(!st.valorant, "VALORANT closed", if st.valorant { "running — loads/restores are blocked until it is closed" } else { "yes" });
-    check(true, "Vanguard", if st.vanguard { "running (VALSYNC does not interact with it)" } else { "not detected (VALSYNC does not interact with it)" });
+    check(!st.valorant, "VALORANT closed", if st.valorant { "running — close it to load or restore settings" } else { "yes" });
     let patch = e.current_patch();
-    check(patch.is_some(), "Game patch", &patch.unwrap_or_else(|| "unknown (no ShooterGame.log yet)".into()));
+    check(patch.is_some(), "Game patch", &patch.unwrap_or_else(|| "unknown (start VALORANT once)".into()));
     let integrity: String = e.db.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    check(integrity == "ok", "Database integrity", &e.paths.db_path().display().to_string());
+    check(integrity == "ok", "Database", &e.paths.db_path().display().to_string());
     let pending = e.db.pending_ops()?;
-    check(pending.is_empty(), "Operation journal", &if pending.is_empty() { "no interrupted operations".to_string() } else { format!("{} interrupted operation(s) awaiting recovery", pending.len()) });
-    let mut bad = 0;
+    check(pending.is_empty(), "Interrupted operations", &if pending.is_empty() { "none".to_string() } else { format!("{} waiting to be undone", pending.len()) });
     let all = e.db.backups(None)?;
-    for b in &all {
-        if !e.verify_backup(b.id)?.ok {
-            bad += 1;
-        }
-    }
-    check(bad == 0, "Backup integrity", &format!("{} backup(s), {bad} corrupted", all.len()));
-    let key = e.config.api_key();
-    check(key.is_some(), "Riot API key", if key.is_some() { "configured" } else { "not set — Riot ID verification and match data disabled" });
-    if key.is_some() {
-        let api = ctx.api();
-        let shard = e.config.default_shard.clone().unwrap_or_else(|| "na".into());
-        let rt = service::runtime();
-        let mut db = crate::db::Db::open(&e.paths.db_path())?;
-        match rt.block_on(api.platform_status(&mut db, &shard)) {
-            Ok(p) => check(true, "VAL-STATUS-V1", &format!("{} · {} maintenance(s), {} incident(s)", p.name, p.maintenances.len(), p.incidents.len())),
-            Err(err) => check(false, "VAL-STATUS-V1", &err.to_string()),
-        }
-    }
-    check(e.config.rso_client_id.is_some(), "RSO client", if e.config.rso_client_id.is_some() { "configured" } else { "not configured — required by Riot for match data (approved products only)" });
-    term::heading("Settings support");
-    for c in Category::ALL {
-        println!("  {:<26} {}", c.label(), dim(crate::catalog::category_support_note(c)));
-    }
+    let bad = all.iter().filter(|b| !e.verify_backup(b.id).map(|r| r.ok).unwrap_or(false)).count();
+    check(bad == 0, "Backups", &format!("{} backup(s), {bad} damaged", all.len()));
     Ok(())
 }
 
 fn config(ctx: &mut Ctx, action: ConfigAction) -> Result<()> {
+    use crate::appconfig::AppConfig;
     match action {
         ConfigAction::Show => {
-            let rows: Vec<Vec<String>> = crate::appconfig::AppConfig::KEYS
-                .iter()
-                .map(|k| vec![k.to_string(), ctx.engine.config.get_display(k), dim(crate::appconfig::AppConfig::describe(k))])
-                .collect();
+            let rows: Vec<Vec<String>> =
+                AppConfig::KEYS.iter().map(|k| vec![k.to_string(), ctx.engine.config.get_display(k), dim(AppConfig::describe(k))]).collect();
             term::table(&["Setting", "Value", "Description"], &rows);
         }
         ConfigAction::Get { key } => {
-            anyhow::ensure!(crate::appconfig::AppConfig::KEYS.contains(&key.as_str()), "unknown setting '{key}'");
+            anyhow::ensure!(AppConfig::KEYS.contains(&key.as_str()), "unknown setting '{key}'");
             println!("{}", ctx.engine.config.get_display(&key));
         }
         ConfigAction::Set { key, value } => {
@@ -933,11 +858,8 @@ fn config(ctx: &mut Ctx, action: ConfigAction) -> Result<()> {
             term::ok(&format!("{key} = {}", ctx.engine.config.get_display(&key)));
         }
         ConfigAction::Path => {
-            println!("VALORANT config : {}", ctx.engine.paths.valorant_config.display());
-            println!("VALORANT logs   : {}", ctx.engine.paths.valorant_logs.display());
-            println!("VALSYNC data    : {}", ctx.engine.paths.data_dir.display());
-            println!("Database        : {}", ctx.engine.paths.db_path().display());
-            println!("Config file     : {}", ctx.engine.paths.config_path().display());
+            println!("VALORANT settings : {}", ctx.engine.paths.valorant_config.display());
+            println!("VALSYNC data      : {}", ctx.engine.paths.data_dir.display());
         }
     }
     Ok(())

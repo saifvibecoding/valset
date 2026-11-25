@@ -5,11 +5,12 @@ use crate::appconfig::AppConfig;
 use crate::db::{AccountRow, Db};
 use crate::engine::Engine;
 use crate::game::ProcessStatus;
-use crate::matches::{self, MatchView, OwnerStats};
-use crate::riot::models::{Content, Match};
-use crate::riot::{self, RiotApi, rso};
-use anyhow::{Context, Result, anyhow, bail};
-use std::collections::HashSet;
+use crate::matches::{self, LiveView, MatchView, OwnerStats};
+use crate::riot::models::Match;
+use crate::riot::{Session, content};
+use anyhow::Result;
+use std::collections::HashMap;
+use std::path::Path;
 
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime")
@@ -21,6 +22,9 @@ pub struct StatusInfo {
     pub active: Option<(AccountRow, String, DetectMethod)>,
     pub account_count: usize,
     pub processes: ProcessStatus,
+    /// Signed in to the Riot Client (account settings available).
+    pub riot_signed_in: bool,
+    pub riot_error: Option<String>,
     pub patch: Option<String>,
     pub last_saved_profile: Option<String>,
     pub profile_count: usize,
@@ -29,24 +33,23 @@ pub struct StatusInfo {
     pub switch: Option<crate::accounts::AccountSwitch>,
     pub undo_available: bool,
     pub redo_available: bool,
-    pub api_key: bool,
 }
 
-/// Gather the main-menu / `valsync status` dashboard (cheap: a few file stats
-/// and SQLite reads, no network).
+/// Gather the main-menu / `valsync status` dashboard (local only, no network).
 pub fn status(engine: &Engine) -> Result<StatusInfo> {
     let det = engine.detection();
     let switch = crate::accounts::sync_with_db(&engine.db, &det)?;
     let mut s = StatusInfo {
         config_dir_exists: det.config_exists,
-        account_count: det.accounts.len(),
+        account_count: engine.db.accounts()?.len(),
         processes: engine.probe.status(),
+        riot_signed_in: engine.cloud_account().is_some(),
+        riot_error: engine.cloud_error.clone(),
         patch: engine.current_patch(),
         last_saved_profile: engine.db.meta_get("last_saved_profile")?,
         profile_count: engine.db.profiles()?.len(),
         backup_count_total: engine.db.backup_count(None)?,
         switch,
-        api_key: engine.config.api_key().is_some(),
         ..Default::default()
     };
     if let Some((a, m)) = det.active {
@@ -59,146 +62,168 @@ pub fn status(engine: &Engine) -> Result<StatusInfo> {
     Ok(s)
 }
 
-pub fn shard_for(acc: &AccountRow, cfg: &AppConfig) -> String {
-    acc.shard.as_deref().and_then(riot::normalize_shard).or_else(|| cfg.default_shard.clone()).unwrap_or_else(|| "na".into())
+pub async fn connect(logs_dir: &Path, db: &Db, cfg: &AppConfig) -> Result<Session> {
+    let known = cfg.region.clone().or_else(|| db.meta_get("last_region").ok().flatten());
+    Session::connect(logs_dir, known.as_deref()).await
+}
+
+/// Stored matches of an account, newest first.
+pub fn stored_matches(db: &Db, puuid: &str, limit: usize) -> Result<Vec<Match>> {
+    Ok(db.matches(puuid, limit)?.into_iter().filter_map(|s| serde_json::from_str(&s).ok()).collect())
 }
 
 #[derive(Debug, Clone)]
-pub enum IdentityResult {
-    /// Riot API confirmed the Riot ID belongs to the local PUUID.
-    Verified,
-    /// Riot ID exists, but the API returns app-encrypted PUUIDs so ownership of
-    /// this local config folder could not be proven (use RSO to verify).
-    ExistsUnverified,
-    /// No API key: stored as entered.
-    StoredManual,
-}
-
-/// Record a user-entered Riot ID for a local account, verifying it if possible.
-pub async fn set_riot_id(api: &RiotApi, db: &mut Db, cfg: &AppConfig, puuid: &str, riot_id: &str) -> Result<IdentityResult> {
-    let (name, tag) = crate::accounts::parse_riot_id(riot_id).ok_or_else(|| anyhow!("'{riot_id}' is not a valid Riot ID (expected Name#TAG)"))?;
-    let acc = db.account(puuid)?.unwrap_or(AccountRow { puuid: puuid.to_string(), ..Default::default() });
-    if !api.has_key() {
-        db.set_account_identity(puuid, &name, &tag, "manual", false, None)?;
-        return Ok(IdentityResult::StoredManual);
-    }
-    let region = riot::region_for_shard(&shard_for(&acc, cfg));
-    match api.account_by_riot_id(db, region, &name, &tag).await {
-        Ok(dto) => {
-            let n = dto.game_name.clone().unwrap_or(name);
-            let t = dto.tag_line.clone().unwrap_or(tag);
-            if dto.puuid.eq_ignore_ascii_case(puuid) {
-                db.set_account_identity(puuid, &n, &t, "api", true, Some(&dto.puuid))?;
-                Ok(IdentityResult::Verified)
-            } else {
-                db.set_account_identity(puuid, &n, &t, "manual", false, Some(&dto.puuid))?;
-                Ok(IdentityResult::ExistsUnverified)
-            }
-        }
-        Err(riot::ApiError::NotFound) => bail!("Riot ID {name}#{tag} does not exist"),
-        Err(e) => {
-            db.set_account_identity(puuid, &name, &tag, "manual", false, None)?;
-            Err(anyhow!("saved as unverified; verification failed: {e}"))
-        }
-    }
-}
-
-/// Try to fill in the Riot ID of a local account from ACCOUNT-V1 (by PUUID).
-pub async fn refresh_identity(api: &RiotApi, db: &mut Db, cfg: &AppConfig, puuid: &str) -> Result<Option<String>> {
-    if !api.has_key() {
-        return Ok(None);
-    }
-    db.touch_account(puuid, None)?;
-    let acc = db.account(puuid)?.context("unknown account")?;
-    let region = riot::region_for_shard(&shard_for(&acc, cfg));
-    let lookup = acc.api_puuid.clone().unwrap_or_else(|| puuid.to_string());
-    match api.account_by_puuid(db, region, &lookup).await {
-        Ok(dto) => {
-            if let (Some(n), Some(t)) = (dto.game_name.clone(), dto.tag_line.clone()) {
-                let verified = acc.verified || dto.puuid.eq_ignore_ascii_case(puuid);
-                let source = if acc.source == "rso" { "rso" } else { "api" };
-                db.set_account_identity(puuid, &n, &t, source, verified, Some(&dto.puuid))?;
-                if let Ok(sh) = api.active_shard(db, region, &dto.puuid).await
-                    && let Some(s) = riot::normalize_shard(&sh.active_shard)
-                {
-                    db.set_account_shard(puuid, &s)?;
-                }
-                return Ok(Some(format!("{n}#{t}")));
-            }
-            Ok(None)
-        }
-        Err(riot::ApiError::NotFound) => Ok(None),
-        Err(e) => Err(anyhow!("{e}")),
-    }
-}
-
-/// Riot Sign On for the currently active local account.
-pub async fn rso_link(api: &RiotApi, db: &mut Db, cfg: &AppConfig, local_puuid: &str, open: bool, on_url: impl Fn(&str)) -> Result<String> {
-    let client_id = cfg.rso_client_id.clone().context("RSO requires a client id issued by Riot for an approved product (`valsync config set rso_client_id <id>`)")?;
-    let client_secret = cfg.rso_secret().context("RSO requires a client secret (set VALSYNC_RSO_CLIENT_SECRET or rso_client_secret)")?;
-    let acc = db.account(local_puuid)?.unwrap_or(AccountRow { puuid: local_puuid.to_string(), ..Default::default() });
-    let region = riot::region_for_shard(&shard_for(&acc, cfg)).to_string();
-    let rcfg = rso::RsoConfig { client_id, client_secret, port: cfg.rso_redirect_port, region };
-    let dto = rso::login(&rcfg, api, open, on_url).await?;
-    let (n, t) = (dto.game_name.clone().unwrap_or_default(), dto.tag_line.clone().unwrap_or_default());
-    db.touch_account(local_puuid, None)?;
-    db.set_account_identity(local_puuid, &n, &t, "rso", true, Some(&dto.puuid))?;
-    db.set_account_consent(local_puuid, true)?;
-    Ok(format!("{n}#{t}"))
-}
-
-/// Stored matches of a consenting account, newest first.
-pub fn stored_matches(db: &Db, local_puuid: &str, limit: usize) -> Result<Vec<Match>> {
-    Ok(db.matches(local_puuid, limit)?.into_iter().filter_map(|s| serde_json::from_str(&s).ok()).collect())
-}
-
-pub fn cached_content(db: &Db, cfg: &AppConfig, shard: &str) -> Option<Content> {
-    // Content is cached by RiotApi::content; read without network.
-    db.conn
-        .query_row("SELECT value FROM cache WHERE key=?1", [format!("content:{shard}:{}", cfg.locale)], |r| r.get::<_, String>(0))
-        .ok()
-        .and_then(|v| serde_json::from_str(&v).ok())
-}
-
 pub struct HistoryData {
-    pub account: AccountRow,
+    pub account: String,
     pub views: Vec<MatchView>,
     pub stats: OwnerStats,
     pub new_matches: usize,
     pub warning: Option<String>,
 }
 
-/// Sync (if allowed) and build match history for a local account.
-pub async fn history(api: &RiotApi, db: &mut Db, cfg: &AppConfig, local_puuid: &str, limit: usize, fetch: bool) -> Result<HistoryData> {
-    db.touch_account(local_puuid, None)?;
-    let account = db.account(local_puuid)?.context("unknown account")?;
-    if !account.consent {
-        bail!(
-            "{} has not opted in through Riot Sign On. Riot requires RSO consent before VALORANT match data can be shown (Manage Riot Accounts → Link with RSO, or `valsync accounts link`).",
-            account.display()
-        );
+fn build_history(db: &Db, cfg: &AppConfig, puuid: &str, label: String, limit: usize, extra: Option<&crate::riot::models::Mmr>) -> Result<HistoryData> {
+    let c = content::cached(db);
+    let ms = stored_matches(db, puuid, limit)?;
+    let mut stats = matches::owner_stats(&ms, puuid);
+    if let Some(m) = extra {
+        stats.apply_mmr(m);
     }
-    let api_puuid = account.api_puuid.clone().unwrap_or_else(|| local_puuid.to_string());
-    let shard = shard_for(&account, cfg);
+    let views = ms.iter().map(|m| matches::build_view(m, c.as_ref(), puuid, cfg.hide_other_names)).collect();
+    Ok(HistoryData { account: label, views, stats, new_matches: 0, warning: None })
+}
+
+/// Stored history only (instant, offline).
+pub fn history_offline(db: &Db, cfg: &AppConfig, puuid: &str, limit: usize) -> Result<HistoryData> {
+    let label = db.account(puuid)?.map(|a| a.display()).unwrap_or_else(|| crate::db::short_id(puuid));
+    let mut h = build_history(db, cfg, puuid, label, limit, None)?;
+    if let Ok(Some(raw)) = db.meta_get(&format!("mmr:{puuid}"))
+        && let Ok(m) = serde_json::from_str(&raw)
+    {
+        h.stats.apply_mmr(&m);
+    }
+    Ok(h)
+}
+
+/// Download new matches + rank for the signed-in account, then build the history.
+pub async fn history(session: &Session, db: &Db, cfg: &AppConfig, limit: usize) -> Result<HistoryData> {
+    let content = content::load(db).await;
+    let _ = content; // cached for build_history
     let mut warning = None;
-    let mut new_matches = 0;
-    if fetch {
-        if !api.has_key() {
-            warning = Some(riot::ApiError::NoKey.to_string());
-        } else {
-            if let Err(e) = api.content(db, &shard, &cfg.locale).await {
-                warning = Some(format!("content: {e}"));
-            }
-            match api.sync_matches(db, &shard, &api_puuid, local_puuid, limit.min(20)).await {
-                Ok(n) => new_matches = n,
-                Err(e) => warning = Some(e.to_string()),
+    let mut new = 0;
+    match session.match_history(limit.min(20)).await {
+        Ok(list) => {
+            for e in list.history.iter().take(limit) {
+                if db.has_match(&e.match_id, &session.puuid).unwrap_or(false) {
+                    continue;
+                }
+                match session.match_details(&e.match_id).await {
+                    Ok((m, _)) => {
+                        let compact = serde_json::to_string(&m)?;
+                        db.store_match(&e.match_id, &session.puuid, m.match_info.game_start_millis, &m.match_info.queue_id, &compact)?;
+                        new += 1;
+                    }
+                    Err(err) => {
+                        warning = Some(format!("{err:#}"));
+                        break;
+                    }
+                }
             }
         }
+        Err(e) => warning = Some(format!("{e:#}")),
     }
-    let content = cached_content(db, cfg, &shard);
-    let consented: HashSet<String> = db.accounts()?.into_iter().filter(|a| a.consent).filter_map(|a| a.api_puuid).collect();
-    let ms = stored_matches(db, local_puuid, limit)?;
-    let stats = matches::owner_stats(&ms, &api_puuid);
-    let views = ms.iter().map(|m| matches::build_view(m, content.as_ref(), &api_puuid, &consented, cfg.hide_other_names)).collect();
-    Ok(HistoryData { account, views, stats, new_matches, warning })
+    let mmr = session.mmr().await.ok();
+    if let Some(m) = &mmr
+        && let Ok(j) = serde_json::to_string(m)
+    {
+        let _ = db.meta_set(&format!("mmr:{}", session.puuid), &j);
+    }
+    let label = session.riot_id().unwrap_or_else(|| crate::db::short_id(&session.puuid));
+    let mut h = build_history(db, cfg, &session.puuid, label, limit, mmr.as_ref())?;
+    if let Some(l) = session.account_level().await {
+        h.stats.level = Some(l);
+    }
+    h.new_matches = new;
+    h.warning = warning;
+    Ok(h)
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveData {
+    pub account: String,
+    pub view: Option<LiveView>,
+    pub stats: OwnerStats,
+    pub last_match: Option<MatchView>,
+    pub warning: Option<String>,
+}
+
+async fn names_for(session: &Session, db: &Db, puuids: Vec<String>) -> HashMap<String, (String, String)> {
+    let mut out = HashMap::new();
+    let mut missing = Vec::new();
+    for p in puuids {
+        match db.cache_get(&format!("name:{p}")).ok().flatten().and_then(|v| v.split_once('#').map(|(a, b)| (a.to_string(), b.to_string()))) {
+            Some(n) => {
+                out.insert(p, n);
+            }
+            None => missing.push(p),
+        }
+    }
+    if let Ok(list) = session.names(&missing).await {
+        for n in list {
+            if !n.game_name.is_empty() {
+                let _ = db.cache_put(&format!("name:{}", n.subject), &format!("{}#{}", n.game_name, n.tag_line), 86_400);
+            }
+            out.insert(n.subject, (n.game_name, n.tag_line));
+        }
+    }
+    out
+}
+
+/// Current agent select / match for the signed-in account, plus own stats.
+/// `cached_loadouts` avoids re-downloading loadouts for the same match.
+pub async fn live(session: &Session, db: &Db, cfg: &AppConfig, cached: Option<&LiveView>) -> Result<LiveData> {
+    let content = content::load(db).await;
+    let mut warning = None;
+    let mut view = None;
+    match session.current_game().await {
+        Ok(Some(m)) => {
+            if let Some(c) = cached.filter(|c| c.match_id == m.match_id && c.phase == matches::LivePhase::InGame) {
+                view = Some(c.clone());
+            } else {
+                let loadouts = session.current_loadouts(&m.match_id).await.ok();
+                let visible: Vec<String> = m.players.iter().filter(|p| !p.player_identity.incognito || p.subject == session.puuid).map(|p| p.subject.clone()).collect();
+                let names = names_for(session, db, visible).await;
+                view = Some(matches::build_live(&m, loadouts.as_ref(), &names, Some(&content), &session.puuid, cfg.hide_other_names));
+            }
+        }
+        Ok(None) => match session.pregame().await {
+            Ok(Some(p)) => {
+                let visible: Vec<String> = p
+                    .ally_team
+                    .iter()
+                    .flat_map(|t| t.players.iter())
+                    .filter(|x| !x.player_identity.incognito || x.subject == session.puuid)
+                    .map(|x| x.subject.clone())
+                    .collect();
+                let names = names_for(session, db, visible).await;
+                view = Some(matches::build_pregame(&p, &names, Some(&content), &session.puuid, cfg.hide_other_names));
+            }
+            Ok(None) => {}
+            Err(e) => warning = Some(format!("{e:#}")),
+        },
+        Err(e) => warning = Some(format!("{e:#}")),
+    }
+    // Own stats (rank cached; refreshed when not in a match to keep requests low).
+    let mut h = history_offline(db, cfg, &session.puuid, 20)?;
+    if view.is_none()
+        && let Ok(full) = history(session, db, cfg, 10).await
+    {
+        h = full;
+    }
+    Ok(LiveData {
+        account: session.riot_id().unwrap_or_else(|| crate::db::short_id(&session.puuid)),
+        view,
+        stats: h.stats,
+        last_match: h.views.into_iter().next(),
+        warning: warning.or(h.warning),
+    })
 }

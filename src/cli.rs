@@ -44,12 +44,6 @@ pub enum Command {
         /// Free-form note stored with the profile
         #[arg(long)]
         note: Option<String>,
-        /// Record a crosshair code to paste in-game (cloud setting)
-        #[arg(long)]
-        crosshair_code: Option<String>,
-        /// Record your sensitivity for the manual checklist (cloud setting)
-        #[arg(long)]
-        sens: Option<String>,
         /// Save from this account instead of the active one (PUUID, folder or Name#TAG)
         #[arg(long)]
         account: Option<String>,
@@ -124,18 +118,16 @@ pub enum Command {
         #[arg(long)]
         overwrite: bool,
     },
-    /// Live match dashboard (refreshes from supported APIs only)
+    /// Live match dashboard (agent select and in game)
     Live {
         /// Render once and exit (no refresh loop)
         #[arg(long)]
         once: bool,
     },
-    /// Match history for an RSO-linked account
+    /// Your recent matches, rank, RR and peak
     History {
         #[arg(short = 'n', long, default_value_t = 10)]
         count: usize,
-        #[arg(long)]
-        account: Option<String>,
         /// Use stored matches only (no network)
         #[arg(long)]
         offline: bool,
@@ -155,25 +147,9 @@ pub enum Command {
 pub enum AccountAction {
     /// List accounts (default)
     List,
-    /// Set the Riot ID (Name#TAG) of a local account; verified via ACCOUNT-V1 when an API key is configured
-    Name { riot_id: String, #[arg(long)] account: Option<String> },
-    /// Manually select the active account (fallback when detection fails)
-    Select { account: String },
-    /// Clear the manual selection and use automatic detection
-    Auto,
-    /// Opt in with Riot Sign On (requires an approved RSO client)
-    Link {
-        #[arg(long)]
-        account: Option<String>,
-        /// Print the URL instead of opening a browser
-        #[arg(long)]
-        no_browser: bool,
-    },
-    /// Withdraw RSO consent and delete stored match data for the account
-    Unlink { account: Option<String> },
     /// Set the preferred profile for an account
     Prefer { profile: String, #[arg(long)] account: Option<String> },
-    /// Forget an account (does not touch its game files)
+    /// Forget an account (does not touch its settings or backups)
     Forget { account: String },
     /// Show detected account switches
     Switches,

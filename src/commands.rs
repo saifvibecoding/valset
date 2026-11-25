@@ -309,6 +309,9 @@ fn load(ctx: &mut Ctx, name: &str, categories: &str, dry_run: bool, account: Opt
         term::ok(&format!("Done! {} setting(s) applied and verified.", out.plan.changes.len()));
         println!("  Changed your mind? Run {} (backup #{}).", bold("valsync undo"), txn.pre_backup);
     }
+    if out.plan.video_skipped {
+        term::warn("Video settings were not copied (this account hasn't started VALORANT on this PC yet). Start the game once, close it, then run this again to copy them.");
+    }
     print_manual(&out.plan.manual, &row.profile.manual);
     Ok(())
 }
@@ -677,10 +680,11 @@ fn tier_text(t: Option<i32>) -> String {
 
 pub fn print_stats(s: &matches::OwnerStats) {
     println!(
-        "  Rank {} {} · Peak {} · Level {} · K/D {} · HS {} · Win rate {} ({} games)",
+        "  Rank {} {} · Peak {} {} · Level {} · K/D {} · HS {} · Win rate {} ({} games)",
         tier_text(s.current_tier),
         s.rr.map(|r| format!("{r} RR")).unwrap_or_default(),
         tier_text(s.peak_tier),
+        s.peak_rr.map(|r| format!("{r} RR")).unwrap_or_default(),
         s.level.map(|l| l.to_string()).unwrap_or_else(|| "N/A".into()),
         s.kd().map(|k| format!("{k:.2}")).unwrap_or_else(|| "N/A".into()),
         matches::fmt_opt_pct(s.hs_pct()),

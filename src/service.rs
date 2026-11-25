@@ -6,7 +6,7 @@ use crate::db::{AccountRow, Db};
 use crate::engine::Engine;
 use crate::game::ProcessStatus;
 use crate::matches::{self, LiveView, MatchView, OwnerStats};
-use crate::riot::models::Match;
+use crate::riot::models::{Match, Peak};
 use crate::riot::{Session, content};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -81,12 +81,19 @@ pub struct HistoryData {
     pub warning: Option<String>,
 }
 
+fn stored_peak(db: &Db, puuid: &str) -> Option<Peak> {
+    db.meta_get(&format!("peak:{puuid}")).ok().flatten().and_then(|v| serde_json::from_str(&v).ok())
+}
+
 fn build_history(db: &Db, cfg: &AppConfig, puuid: &str, label: String, limit: usize, extra: Option<&crate::riot::models::Mmr>) -> Result<HistoryData> {
     let c = content::cached(db);
     let ms = stored_matches(db, puuid, limit)?;
     let mut stats = matches::owner_stats(&ms, puuid);
     if let Some(m) = extra {
         stats.apply_mmr(m);
+    }
+    if let Some(p) = stored_peak(db, puuid) {
+        stats.apply_peak(p);
     }
     let views = ms.iter().map(|m| matches::build_view(m, c.as_ref(), puuid, cfg.hide_other_names)).collect();
     Ok(HistoryData { account: label, views, stats, new_matches: 0, warning: None })
@@ -131,14 +138,35 @@ pub async fn history(session: &Session, db: &Db, cfg: &AppConfig, limit: usize) 
         }
         Err(e) => warning = Some(format!("{e:#}")),
     }
-    let mmr = session.mmr().await.ok();
+    let mmr = match session.mmr().await {
+        Ok(m) => Some(m),
+        Err(e) => {
+            warning.get_or_insert(format!("rank: {e:#}"));
+            None
+        }
+    };
     if let Some(m) = &mmr
         && let Ok(j) = serde_json::to_string(m)
     {
         let _ = db.meta_set(&format!("mmr:{}", session.puuid), &j);
     }
+    // Rank history: the full history once (up to 100 matches), then the newest page.
+    let mut updates = Vec::new();
+    let pages = if stored_peak(db, &session.puuid).is_some() { 1 } else { 5 };
+    for page in 0..pages {
+        match session.competitive_updates(page * 20).await {
+            Ok(u) if !u.matches.is_empty() => updates.extend(u.matches),
+            _ => break,
+        }
+    }
     let label = session.riot_id().unwrap_or_else(|| crate::db::short_id(&session.puuid));
     let mut h = build_history(db, cfg, &session.puuid, label, limit, mmr.as_ref())?;
+    h.stats.apply_updates(&updates);
+    if let Some(t) = h.stats.peak_tier
+        && let Ok(j) = serde_json::to_string(&Peak { tier: t, rr: h.stats.peak_rr })
+    {
+        let _ = db.meta_set(&format!("peak:{}", session.puuid), &j);
+    }
     if let Some(l) = session.account_level().await {
         h.stats.level = Some(l);
     }

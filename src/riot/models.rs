@@ -188,6 +188,47 @@ pub struct CompetitiveUpdate {
     pub tier_after_update: i32,
     pub ranked_rating_after_update: i32,
     pub ranked_rating_earned: i32,
+    pub match_start_time: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct CompetitiveUpdates {
+    pub matches: Vec<CompetitiveUpdate>,
+}
+
+/// Tier numbers changed when Ascendant was added; normalise old acts.
+pub fn normalize_tier(season_id: &str, tier: i32) -> i32 {
+    if PRE_ASCENDANT_SEASONS.contains(&season_id) && tier > 20 { tier + 3 } else { tier }
+}
+
+/// Highest rank ever reached, with the best RR seen at that rank.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peak {
+    pub tier: i32,
+    pub rr: Option<i32>,
+}
+
+impl Peak {
+    pub fn merge_tier(&mut self, tier: i32) {
+        if tier > self.tier {
+            self.tier = tier;
+            self.rr = None;
+        }
+    }
+    pub fn merge(&mut self, tier: i32, rr: i32) {
+        if tier > self.tier {
+            *self = Peak { tier, rr: Some(rr) };
+        } else if tier == self.tier && tier > 0 {
+            self.rr = Some(self.rr.map_or(rr, |x| x.max(rr)));
+        }
+    }
+    pub fn merge_peak(&mut self, other: Peak) {
+        match other.rr {
+            Some(rr) => self.merge(other.tier, rr),
+            None => self.merge_tier(other.tier),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -380,8 +421,15 @@ pub const PRE_ASCENDANT_SEASONS: [&str; 12] = [
 impl Mmr {
     /// (current tier, current RR) from the latest competitive update.
     pub fn current(&self) -> Option<(i32, i32)> {
-        let u = self.latest_competitive_update.as_ref()?;
-        if u.tier_after_update > 0 { Some((u.tier_after_update, u.ranked_rating_after_update)) } else { None }
+        if let Some(u) = &self.latest_competitive_update
+            && u.tier_after_update > 0
+        {
+            return Some((u.tier_after_update, u.ranked_rating_after_update));
+        }
+        // No recent update: the act with the most games.
+        let seasons = self.queue_skills.get("competitive")?.seasonal_info_by_season_id.as_ref()?;
+        let s = seasons.values().filter(|s| s.competitive_tier.max(s.rank) > 2).max_by_key(|s| s.number_of_games)?;
+        Some((normalize_tier(&s.season_id, s.competitive_tier.max(s.rank)), s.ranked_rating))
     }
 
     /// Highest tier with at least one recorded win across all acts.
@@ -389,7 +437,7 @@ impl Mmr {
         let seasons = self.queue_skills.get("competitive")?.seasonal_info_by_season_id.as_ref()?;
         let mut best = 0;
         for (id, s) in seasons {
-            let shift = |t: i32| if PRE_ASCENDANT_SEASONS.contains(&id.as_str()) && t > 20 { t + 3 } else { t };
+            let shift = |t: i32| normalize_tier(id, t);
             for (tier, wins) in s.wins_by_tier.iter().flatten() {
                 if let Ok(t) = tier.parse::<i32>()
                     && *wins > 0

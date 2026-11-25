@@ -107,8 +107,9 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 fn draw_modal(f: &mut Frame, m: &Modal, area: Rect) {
     match m {
         Modal::Confirm { title, body, .. } => {
-            let h = body.len() as u16 + 5;
-            let r = centered(area, 72, h);
+            let inner = 74usize;
+            let h = body.iter().map(|l| l.width().max(1).div_ceil(inner) as u16).sum::<u16>() + 5;
+            let r = centered(area, inner as u16 + 2, h);
             f.render_widget(Clear, r);
             let mut lines = body.clone();
             lines.push(Line::from(""));
@@ -227,7 +228,8 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_text(f: &mut Frame, tv: &TextView, area: Rect) {
-    f.render_widget(Paragraph::new(tv.lines.clone()).scroll((tv.scroll, 0)).block(block(tv.title.clone())), area);
+    let p = Paragraph::new(tv.lines.clone()).scroll((tv.scroll, 0)).block(block(tv.title.clone()));
+    f.render_widget(if tv.wrap { p.wrap(Wrap { trim: false }) } else { p }, area);
 }
 
 fn table_state(sel: usize) -> TableState {
@@ -310,7 +312,10 @@ fn draw_load(f: &mut Frame, app: &App, st: &LoadState, area: Rect) {
                 lines.push(change_line(c));
             }
             lines.extend(manual_lines(&plan.manual, &st.profiles[st.sel].profile.manual));
-            f.render_widget(Paragraph::new(lines).scroll((st.scroll as u16, 0)).block(block(format!("Preview: '{}' → {target}", st.profiles[st.sel].name))), area);
+            f.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((st.scroll as u16, 0)).block(block(format!("Preview: '{}' → {target}", st.profiles[st.sel].name))),
+                area,
+            );
         }
     }
 }
@@ -440,9 +445,8 @@ fn opt_cell(v: Option<String>) -> Cell<'static> {
 /// 5-row team table. Rank/RR/peak/K/D/HS/WR are shown for you only.
 fn team_table(players: &[PlayerLine], title: String, owner: Option<&crate::matches::OwnerStats>, width: u16, live: bool) -> Table<'static> {
     let wide = width >= 150;
-    let mut cols = vec!["Player", "Agent", "Rank", "RR", "Peak", "Lvl", if live { "K/D" } else { "K/D/A" }, "HS%", "WR", "Vandal", "Phantom"];
+    let mut cols = vec!["Player", "Agent", "Rank", "RR", "Peak", "Peak RR", "Lvl", if live { "K/D" } else { "K/D/A" }, "HS%", "WR", "Vandal", "Phantom"];
     if wide {
-        cols.insert(5, "Peak RR");
         cols.push("Variant");
     }
     let rows: Vec<Row> = (0..5)
@@ -455,10 +459,8 @@ fn team_table(players: &[PlayerLine], title: String, owner: Option<&crate::match
                     tier_cell(me.and_then(|o| o.current_tier).or(p.tier)),
                     opt_cell(me.and_then(|o| o.rr).map(|r| r.to_string())),
                     tier_cell(me.and_then(|o| o.peak_tier)),
+                    opt_cell(me.and_then(|o| o.peak_rr).map(|r| r.to_string())),
                 ];
-                if wide {
-                    cells.push(na());
-                }
                 cells.push(opt_cell(p.level.or(me.and_then(|o| o.level)).map(|l| l.to_string())));
                 if live {
                     cells.push(opt_cell(me.and_then(|o| o.kd()).map(|k| format!("{k:.2}"))));
@@ -484,15 +486,15 @@ fn team_table(players: &[PlayerLine], title: String, owner: Option<&crate::match
         Constraint::Length(12),
         Constraint::Length(4),
         Constraint::Length(12),
+        Constraint::Length(7),
         Constraint::Length(4),
         Constraint::Length(if live { 5 } else { 9 }),
         Constraint::Length(6),
         Constraint::Length(4),
-        Constraint::Length(16),
-        Constraint::Length(16),
+        Constraint::Length(14),
+        Constraint::Length(14),
     ];
     if wide {
-        widths.insert(5, Constraint::Length(8));
         widths.push(Constraint::Length(18));
     }
     Table::new(rows, widths).header(header(&cols)).block(block(title))
@@ -619,11 +621,13 @@ fn draw_history(f: &mut Frame, app: &App, st: &HistoryState, area: Rect) {
         Span::raw(format!("Games {} · Win rate {} · K/D {} · HS {} · ", s.games, matches::fmt_opt_pct(s.win_rate()), s.kd().map(|k| format!("{k:.2}")).unwrap_or_else(|| "N/A".into()), matches::fmt_opt_pct(s.hs_pct()))),
         Span::raw("Rank "),
         Span::styled(matches::fmt_tier(s.current_tier), Style::new().fg(s.current_tier.map(rank::color).unwrap_or(MUTED))),
-        Span::raw(" · Peak recorded "),
+        Span::raw(s.rr.map(|r| format!(" {r} RR")).unwrap_or_default()),
+        Span::raw(" · Peak "),
         Span::styled(matches::fmt_tier(s.peak_tier), Style::new().fg(s.peak_tier.map(rank::color).unwrap_or(MUTED))),
+        Span::raw(s.peak_rr.map(|r| format!(" {r} RR")).unwrap_or_default()),
         Span::raw(format!(" · Level {}", s.level.map(|l| l.to_string()).unwrap_or_else(|| "N/A".into()))),
     ])];
-    lines.push(Line::from(Span::styled("RR and skins are not exposed by supported Riot APIs (N/A). Peak = highest rank in matches stored by VALSYNC.", Style::new().fg(MUTED))));
+    lines.push(Line::from(Span::styled("Peak = highest rank you've reached (all acts). Peak RR = best RR seen at that rank in your recent competitive history.", Style::new().fg(MUTED))));
     if let Some(e) = &st.error {
         lines.push(Line::from(Span::styled(e.clone(), Style::new().fg(Color::Yellow))));
     }

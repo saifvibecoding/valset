@@ -31,7 +31,7 @@ Don't like it? Press **3** (Restore Previous Settings) and choose **Undo**. The 
 | Keybinds, including agent keybinds | ✅ |
 | Minimap, HUD, enemy highlight color | ✅ |
 | Audio volumes, accessibility, general options | ✅ |
-| Resolution, graphics, display mode, FPS limit, NVIDIA Reflex | ✅ (the other account must have started VALORANT on this PC at least once) |
+| Resolution, graphics, display mode, FPS limit, NVIDIA Reflex | ✅ if the other account has started VALORANT on this PC at least once. If not, VALSYNC warns you and copies everything else; start the game once and load again to get these too. |
 | Your audio devices and monitor | ❌ The other account keeps its own, on purpose |
 | Skins, name, rank, anything tied to your account | ❌ Never touched |
 
@@ -51,8 +51,8 @@ Use the arrow keys and **Enter**, or press the number. **Esc** goes back.
 
 - **Restore Previous Settings:** undo or redo your last change, or put the account back to how it was before VALSYNC ever touched it.
 - **Manage Settings Profiles:** rename, copy, delete, favourite (★) or compare profiles. You can also export a profile to a `.valsync` file to share it and import one from a friend.
-- **Live Match:** shows everyone's agent and level, plus their Vandal and Phantom skins, in agent select and in game. Your own row adds your rank, RR, peak, K/D, HS% and win rate.
-- **Match History:** your recent matches with K/D/A and HS%, plus your rank, RR and peak.
+- **Live Match:** shows everyone's agent and level, plus their Vandal and Phantom skins, in agent select and in game. Your own row adds your rank, RR, peak rank, peak RR, K/D, HS% and win rate.
+- **Match History:** your recent matches with K/D/A and HS%, plus your rank, RR, peak rank and peak RR.
 - **Backup History:** every backup VALSYNC made. Restore, check or delete them, or make one yourself.
 
 Account switching happens in the Riot Client as usual, and VALSYNC follows automatically.
@@ -75,7 +75,7 @@ valsync export "Main"       → main.valsync
 valsync import main.valsync
 valsync backups             list backups
 valsync live                live match screen
-valsync history             your recent matches, rank, RR, peak
+valsync history             your recent matches, rank, RR, peak rank and RR
 valsync status              who's signed in, game status
 valsync doctor              check that everything works
 valsync help
@@ -109,8 +109,8 @@ This is a beta. It's built and tested automatically on Windows, but it hasn't be
 
 Known limits:
 
-- Video settings only copy to an account that has started VALORANT on this PC at least once, because the game creates that account's settings files on its first launch.
-- Peak RR isn't available from Riot, so it shows N/A.
+- Video settings only copy to an account that has started VALORANT on this PC at least once, because the game creates that account's settings files on its first launch. VALSYNC tells you when this happens.
+- Peak rank covers every act. Peak RR comes from your last ~100 competitive games. If your peak is older than that, peak RR shows N/A.
 
 ## For developers
 

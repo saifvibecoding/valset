@@ -32,7 +32,7 @@ pub struct Session {
     pub tag_line: Option<String>,
     pub region: String,
     pub shard: String,
-    pub client_version: String,
+    client_version: Mutex<String>,
     access_token: String,
     entitlement: String,
     http: reqwest::Client,
@@ -121,7 +121,7 @@ impl Session {
             tag_line: chat.as_ref().map(|c| c.game_tag.clone()),
             region,
             shard,
-            client_version,
+            client_version: Mutex::new(client_version),
             access_token: ent.access_token,
             entitlement: ent.token,
             http,
@@ -149,7 +149,7 @@ impl Session {
         req.bearer_auth(&self.access_token)
             .header("X-Riot-Entitlements-JWT", &self.entitlement)
             .header("X-Riot-ClientPlatform", CLIENT_PLATFORM)
-            .header("X-Riot-ClientVersion", &self.client_version)
+            .header("X-Riot-ClientVersion", self.client_version.lock().unwrap().clone())
     }
 
     async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<reqwest::Response> {
@@ -222,8 +222,36 @@ impl Session {
         Ok((m, raw))
     }
 
+    pub fn client_version(&self) -> String {
+        self.client_version.lock().unwrap().clone()
+    }
+
+    /// Rank endpoints answer 404 when the client-version header doesn't match
+    /// the live build; retry once with the current version from valorant-api.com.
+    async fn get_versioned<T: serde::de::DeserializeOwned>(&self, url: String, what: &str) -> Result<T> {
+        match self.get::<T>(url.clone(), what).await {
+            Err(e) if status_of(&e) == Some(404) => {
+                let fresh = super::content::client_version(&self.http).await;
+                match fresh {
+                    Some(v) if v != self.client_version() => {
+                        *self.client_version.lock().unwrap() = v;
+                        self.get(url, what).await
+                    }
+                    _ => Err(e),
+                }
+            }
+            other => other,
+        }
+    }
+
     pub async fn mmr(&self) -> Result<Mmr> {
-        self.get(self.pd(&format!("/mmr/v1/players/{}", self.puuid)), "rank").await
+        self.get_versioned(self.pd(&format!("/mmr/v1/players/{}", self.puuid)), "rank").await
+    }
+
+    /// Rank/RR change of each competitive match, newest first (20 per page).
+    pub async fn competitive_updates(&self, start: usize) -> Result<CompetitiveUpdates> {
+        let url = self.pd(&format!("/mmr/v1/players/{}/competitiveupdates?startIndex={start}&endIndex={}&queue=competitive", self.puuid, start + 20));
+        self.get_versioned(url, "rank history").await
     }
 
     pub async fn account_level(&self) -> Option<i32> {

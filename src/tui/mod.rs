@@ -94,6 +94,7 @@ pub enum Modal {
 }
 
 pub struct TextView {
+    pub wrap: bool,
     pub title: String,
     pub lines: Vec<Line<'static>>,
     pub scroll: u16,
@@ -702,7 +703,7 @@ impl App {
 
     fn show_text(&mut self, title: impl Into<String>, lines: Vec<Line<'static>>, back_to_current: bool) {
         let back = if back_to_current { Some(Box::new(std::mem::replace(&mut self.screen, Screen::Main))) } else { None };
-        self.screen = Screen::Text(TextView { title: title.into(), lines, scroll: 0, back });
+        self.screen = Screen::Text(TextView { wrap: false, title: title.into(), lines, scroll: 0, back });
     }
 
     fn submit_input(&mut self, kind: InputKind, value: String) {
@@ -892,6 +893,9 @@ impl App {
                         line(format!("Apply {n} change(s) from '{name}' to {target}?")),
                         line("Current settings are backed up automatically first."),
                     ];
+                    for w in &plan.warnings {
+                        body.push(styled(format!("! {w}"), Style::new().fg(Color::Yellow)));
+                    }
                     if guessed {
                         body.push(styled("Warning: the active account was guessed — make sure this is the right account.", Style::new().fg(Color::Yellow)));
                     }
@@ -945,12 +949,18 @@ impl App {
             }
             None => lines.push(line("Nothing needed to change.")),
         }
+        for w in &out.plan.warnings {
+            lines.push(styled(format!("! {w}"), Style::new().fg(Color::Yellow)));
+        }
         lines.push(line(""));
         for c in &out.plan.changes {
             lines.push(change_line(c));
         }
         lines.extend(manual_lines(&out.plan.manual, &profile.manual));
         self.show_text("Load Saved Settings — result", lines, false);
+        if let Screen::Text(tv) = &mut self.screen {
+            tv.wrap = true;
+        }
         Ok(())
     }
 

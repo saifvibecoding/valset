@@ -114,7 +114,13 @@ pub struct LoadPlan {
     pub new_keys: usize,
     pub new_files: Vec<String>,
     pub patch_warning: Option<String>,
+    /// The account has never started VALORANT on this PC, so video settings are skipped.
+    pub video_skipped: bool,
 }
+
+pub const VIDEO_SKIPPED_WARNING: &str = "Video settings will be skipped: this account hasn't started VALORANT on this PC yet. \
+Only your account settings (sensitivity, crosshair, keybinds, HUD, audio and more) will be copied. \
+To copy resolution, graphics and FPS settings too, start VALORANT once on this account, close it, and load again.";
 
 impl LoadPlan {
     pub fn is_empty(&self) -> bool {
@@ -544,7 +550,8 @@ impl Engine {
             .collect();
         if !t.dir.is_dir() {
             if local_entries.iter().any(|e| e.scope == Scope::Local) {
-                plan.warnings.push("Video settings were skipped: start VALORANT once on this account so it creates its settings files, then load again.".into());
+                plan.video_skipped = true;
+                plan.warnings.push(VIDEO_SKIPPED_WARNING.into());
             }
             return Ok(plan);
         }

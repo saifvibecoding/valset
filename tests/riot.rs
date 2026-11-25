@@ -146,6 +146,25 @@ fn handle(mut s: TcpStream) {
         ),
         ("GET", "/pd.eu.a.pvp.net/match-details/v1/matches/m1") => (200, match_json("m1", 1000, 21, true)),
         ("GET", "/pd.eu.a.pvp.net/match-details/v1/matches/m2") => (200, match_json("m2", 2000, 20, false)),
+        ("GET", p) if p.starts_with("/pd.eu.a.pvp.net/mmr/v1/players/") && headers.get("x-riot-clientversion").map(String::as_str) == Some("release-old-1") => {
+            (404, r#"{"errorCode":"RESOURCE_NOT_FOUND"}"#.into())
+        }
+        ("GET", p) if p.starts_with("/pd.eu.a.pvp.net/mmr/v1/players/") && p.contains("/competitiveupdates") => {
+            if p.contains("startIndex=0&") {
+                (
+                    200,
+                    json!({"Subject": me, "Matches": [
+                        {"MatchID": "m2", "SeasonID": "s-new", "MatchStartTime": 2000, "TierAfterUpdate": 20, "RankedRatingAfterUpdate": 57},
+                        {"MatchID": "m1", "SeasonID": "s-new", "MatchStartTime": 1000, "TierAfterUpdate": 21, "RankedRatingAfterUpdate": 12},
+                        {"MatchID": "old1", "SeasonID": "a16955a5-4ad0-f761-5e9e-389df1c892fb", "MatchStartTime": 10, "TierAfterUpdate": 21, "RankedRatingAfterUpdate": 40},
+                        {"MatchID": "old2", "SeasonID": "a16955a5-4ad0-f761-5e9e-389df1c892fb", "MatchStartTime": 9, "TierAfterUpdate": 21, "RankedRatingAfterUpdate": 75}
+                    ]})
+                    .to_string(),
+                )
+            } else {
+                (200, json!({"Subject": me, "Matches": []}).to_string())
+            }
+        }
         ("GET", p) if p.starts_with("/pd.eu.a.pvp.net/mmr/v1/players/") => (
             200,
             json!({"QueueSkills": {"competitive": {"SeasonalInfoBySeasonID": {
@@ -336,9 +355,13 @@ fn history_rank_and_live_match() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let env = Env::new();
     mock(&env);
+    // An outdated game log version: rank calls must recover via the current version.
+    std::fs::create_dir_all(&env.paths.valorant_logs).unwrap();
+    std::fs::write(env.paths.valorant_logs.join("ShooterGame.log"), "LogShooter: Display: CI server version: release-old-1\n").unwrap();
     let e = env.engine();
     let rt = service::runtime();
     let session = rt.block_on(service::connect(&env.paths.valorant_logs, &e.db, &e.config)).unwrap();
+    assert_eq!(session.client_version(), "release-old-1");
     assert_eq!((session.region.as_str(), session.shard.as_str()), ("eu", "eu"));
 
     let h = rt.block_on(service::history(&session, &e.db, &e.config, 10)).unwrap();
@@ -353,6 +376,12 @@ fn history_rank_and_live_match() {
     assert_eq!(h.stats.current_tier, Some(20));
     assert_eq!(h.stats.rr, Some(57));
     assert_eq!(h.stats.peak_tier, Some(24), "pre-Ascendant Immortal 1 (21) maps to tier 24");
+    assert_eq!(h.stats.peak_rr, Some(75), "best RR seen at the peak rank");
+    assert_eq!(session.client_version(), "release-99.01-shipping-1-1", "version refreshed after the 404");
+    // Peak is remembered; offline history shows it too.
+    let off = service::history_offline(&e.db, &e.config, a(), 10).unwrap();
+    assert_eq!((off.stats.peak_tier, off.stats.peak_rr), (Some(24), Some(75)));
+    assert_eq!((off.stats.current_tier, off.stats.rr), (Some(20), Some(57)));
     assert_eq!(h.stats.level, Some(121));
     assert_eq!(h.stats.win_rate(), Some(50.0));
     // Matches are cached: a second sync downloads nothing new.

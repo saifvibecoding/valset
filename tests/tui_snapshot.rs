@@ -82,3 +82,17 @@ fn print_screens_with_cloud() {
         println!("{s}\n=====");
     }
 }
+
+#[test]
+#[ignore]
+fn print_video_skipped_warning() {
+    let env = Env::new();
+    let (mut e, mc) = env.engine_with_cloud();
+    let (t, _) = e.active_target().unwrap();
+    e.save_profile(&t, "Main", false, None, None, vec![]).unwrap();
+    let c = "cccccccc-3333-4333-8333-333333333333";
+    mc.set(c, valsync::cloud::sample_doc(0.9, "x"));
+    mc.sign_in(c);
+    let (s, _) = valsync::tui::render_headless(e, &[KeyCode::Char('2'), KeyCode::Enter, KeyCode::Enter], 100, 32).unwrap();
+    println!("{s}");
+}

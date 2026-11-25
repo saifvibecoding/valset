@@ -621,7 +621,8 @@ fn account_without_local_folder_gets_cloud_settings() {
     assert_eq!((tc.puuid.as_str(), m), (c, DetectMethod::RiotClient));
     assert!(!tc.dir.exists());
     let out = e.apply_load(&p, &tc, &LoadOptions::default()).unwrap();
-    assert!(out.plan.warnings.iter().any(|w| w.contains("Video settings were skipped")));
+    assert!(out.plan.video_skipped);
+    assert!(out.plan.warnings.iter().any(|w| w.contains("Video settings will be skipped") && w.contains("start VALORANT once")));
     assert_eq!(common::sens(&mc.get(c)), 0.176);
     assert!(!tc.dir.exists(), "no folder is invented for the game");
     e.undo(c, false).unwrap();

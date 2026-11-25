@@ -21,6 +21,8 @@ pub struct OwnerStats {
     pub current_tier: Option<i32>,
     pub rr: Option<i32>,
     pub peak_tier: Option<i32>,
+    /// Best RR seen at the peak rank (from Riot's rank history).
+    pub peak_rr: Option<i32>,
     pub level: Option<i32>,
 }
 
@@ -40,7 +42,31 @@ impl OwnerStats {
             self.rr = Some(rr);
         }
         if let Some(p) = mmr.peak_tier() {
-            self.peak_tier = Some(self.peak_tier.map_or(p, |x| x.max(p)));
+            self.apply_peak(models::Peak { tier: p, rr: None });
+        }
+    }
+
+    pub fn apply_peak(&mut self, p: models::Peak) {
+        let mut cur = models::Peak { tier: self.peak_tier.unwrap_or(0), rr: self.peak_rr };
+        cur.merge_peak(p);
+        if cur.tier > 2 {
+            self.peak_tier = Some(cur.tier);
+            self.peak_rr = cur.rr;
+        }
+    }
+
+    /// Fold Riot's per-match rank history into current/peak values.
+    pub fn apply_updates(&mut self, updates: &[models::CompetitiveUpdate]) {
+        let mut peak = models::Peak::default();
+        for u in updates.iter().filter(|u| u.tier_after_update > 2) {
+            peak.merge(models::normalize_tier(&u.season_id, u.tier_after_update), u.ranked_rating_after_update);
+        }
+        self.apply_peak(peak);
+        if self.current_tier.is_none()
+            && let Some(u) = updates.iter().filter(|u| u.tier_after_update > 2).max_by_key(|u| u.match_start_time)
+        {
+            self.current_tier = Some(u.tier_after_update);
+            self.rr = Some(u.ranked_rating_after_update);
         }
     }
 }
@@ -205,7 +231,7 @@ pub fn owner_stats(matches: &[Match], owner: &str) -> OwnerStats {
             if s.current_tier.is_none() {
                 s.current_tier = Some(p.competitive_tier);
             }
-            s.peak_tier = Some(s.peak_tier.map_or(p.competitive_tier, |x| x.max(p.competitive_tier)));
+            s.apply_peak(models::Peak { tier: models::normalize_tier(&m.match_info.season_id, p.competitive_tier), rr: None });
         }
     }
     s
@@ -338,4 +364,30 @@ pub fn fmt_duration(ms: Option<i64>) -> String {
 pub fn fmt_time(ms: i64) -> String {
     use chrono::TimeZone;
     chrono::Local.timestamp_millis_opt(ms).single().map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "N/A".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::riot::models::{CompetitiveUpdate, Peak};
+
+    fn upd(season: &str, tier: i32, rr: i32, t: i64) -> CompetitiveUpdate {
+        CompetitiveUpdate { season_id: season.into(), tier_after_update: tier, ranked_rating_after_update: rr, match_start_time: t, ..Default::default() }
+    }
+
+    #[test]
+    fn peak_from_rank_history() {
+        let mut s = OwnerStats::default();
+        s.apply_peak(Peak { tier: 18, rr: None }); // e.g. from WinsByTier
+        s.apply_updates(&[upd("new", 17, 80, 3), upd("new", 18, 55, 2), upd("new", 18, 91, 1)]);
+        assert_eq!((s.peak_tier, s.peak_rr), (Some(18), Some(91)));
+        assert_eq!((s.current_tier, s.rr), (Some(17), Some(80)), "current = newest update when MMR has none");
+        // A higher peak from an older act without RR data replaces the tier, RR unknown.
+        s.apply_peak(Peak { tier: 21, rr: None });
+        assert_eq!((s.peak_tier, s.peak_rr), (Some(21), None));
+        // Unranked never counts as a peak.
+        let mut z = OwnerStats::default();
+        z.apply_updates(&[upd("new", 0, 0, 1)]);
+        assert_eq!(z.peak_tier, None);
+    }
 }
